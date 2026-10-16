@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Whisper Dictate Setup (terminal)
+Name[ru]=Настройка Whisper Dictate (терминал)
+Comment=Terminal setup for voice dictation
+Exec=whisper-dictate-setup --tui
+Icon=audio-input-microphone
+Categories=Settings;ConsoleOnly;
+Terminal=true

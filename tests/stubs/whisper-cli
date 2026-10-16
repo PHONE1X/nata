@@ -1,0 +1,8 @@
+#!/bin/sh
+# имитация whisper-cli: пишет фиксированный текст в <of>.txt
+while [ $# -gt 0 ]; do
+  case "$1" in -of) out="$2"; shift ;; esac
+  shift
+done
+[ -n "$STUB_WHISPER_FAIL" ] && exit 134
+printf ' Привет, это тест. \n' > "$out.txt"

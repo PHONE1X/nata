@@ -1,0 +1,2070 @@
+#!/usr/bin/env fish
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Голосовая диктовка: запись → whisper.cpp → (опционально) перевод → вставка.
+#
+# Скрипт — переключатель: первый запуск начинает запись, второй останавливает
+# её и ставит задание в очередь на распознавание. Висит на SUPER+U и на кнопке
+# в баре Quickshell (modules/ii/bar/DictateIndicator.qml).
+#
+# Три вещи, ради которых всё устроено именно так:
+#
+# 1. ОКНО-ПОЛУЧАТЕЛЬ ФИКСИРУЕТСЯ В МОМЕНТ СТАРТА ЗАПИСИ.
+#    Пока идёт запись и распознавание, фокус успевает уехать куда угодно — в
+#    другой воркспейс, в игру, в соседний чат. Текст всё равно приедет в то
+#    окно, из которого начали диктовать: адрес окна запоминается сразу, а
+#    перед вставкой окно явно фокусируется — и фокус на нём и остаётся, чтобы
+#    можно было сразу дописывать руками. Исключение: если в этот момент идёт
+#    следующая запись, фокус возвращается назад — вырывать пользователя из
+#    активной диктовки нельзя.
+#
+# 2. ЯЗЫК ВЫВОДА = РАСКЛАДКА ОКНА-ПОЛУЧАТЕЛЯ.
+#    Раскладка отслеживается всё время записи, но засчитывается только пока
+#    сфокусировано само окно-получатель. Причина: hyprland-per-window-layout
+#    держит для каждого окна свою запомненную раскладку, поэтому «раскладка
+#    прямо сейчас» в чужом окне ничего не говорит о том, на каком языке нужен
+#    текст. Итог: начал диктовать в VS Code на русской, переключил на
+#    английскую — приедет английский; ушёл по ходу записи в Telegram (там своя
+#    русская) — на выбор языка это уже не влияет.
+#    Раскладку перебивает закреплённый язык (--set-lang, из попапа):
+#    закрепление за окном важнее закрепления за приложением.
+#
+# 3. ОЧЕРЕДЬ.
+#    Новую запись можно начать, не дожидаясь, пока обработается предыдущая.
+#    Задания складываются в $QUEUE_DIR и разбираются строго по порядку одним
+#    воркером: whisper не должен запускаться в два потока на одной видеокарте,
+#    а два текста, надиктованных в одно и то же окно, не должны поменяться
+#    местами.
+#
+# 4. ВСТАВКА ЖДЁТ, ПОКА ПОЛЬЗОВАТЕЛЬ САМ НЕ ВЕРНЁТСЯ В ОКНО-ПОЛУЧАТЕЛЬ.
+#    Если текст готов, а окно-получатель прямо сейчас не на экране (другой
+#    воркспейс, скрытый scratchpad) — фокус НЕ дёргается принудительно.
+#    Причина архитектурная, не решается кодом: вставка идёт синтетическим
+#    Ctrl+V через wlr-virtual-keyboard, а этот протокол Wayland доставляет
+#    события только в тот surface, у которого прямо сейчас клавиатурный
+#    фокус — а Hyprland на одном мониторе не умеет дать окну фокус, не
+#    показав его (нет «фокус без показа» для чужого воркспейса). Значит
+#    принудительная вставка = обязательный видимый прыжок туда-обратно.
+#    Вместо этого готовый текст оседает в $PENDING_DIR, и отдельный watcher
+#    (`--run-pending-watcher`) раз в 0.5с проверяет `hyprctl activewindow`:
+#    как только пользователь САМ переключился на нужное окно — текст
+#    вставляется в него без единого чужого прыжка фокуса, потому что фокус
+#    и так уже там. Если пользователь так и не вернулся за
+#    $PENDING_TIMEOUT_SECONDS — вставка всё равно происходит принудительно
+#    (тем же прыжком туда-обратно, что раньше), чтобы текст не потерялся
+#    насовсем. Если окно за это время закрыли — текст уходит в буфер обмена
+#    с уведомлением, как и при обычной вставке.
+#
+# 5. ВСТАВКА ЖДЁТ, ПОКА ОТПУСТЯТ МОДИФИКАТОРЫ.
+#    Ctrl+V уходит с виртуального устройства ydotoold, но Hyprland при
+#    разборе биндов складывает модификаторы со ВСЕХ клавиатур сразу. Если в
+#    момент вставки физически зажат SUPER (типично: пользователь только что
+#    переключился в окно-получатель через SUPER+Tab, и pending-watcher увидел
+#    это за свои 0.5с), Hyprland видит CTRL+SUPER+V — бинд «App: Volume
+#    mixer» — и съедает аккорд целиком: в окно не попадает ничего, а на экране
+#    вместо текста открывается pavucontrol-qt. Поэтому перед вставкой
+#    dictate_wait_mods_released ждёт (до $MOD_WAIT_SECONDS), пока все
+#    модификаторы отпустят, и только потом жмёт Ctrl+V. Если не дождались —
+#    текст не теряется и не вставляется вслепую, а уходит в $PENDING_DIR к
+#    watcher-у, который попробует ещё раз через полсекунды.
+#
+# Подкоманды (скрипт переизобретает себя же — см. комментарий у $SELF):
+#   whisper-dictate                  — переключатель записи (то, что на SUPER+U)
+#   whisper-dictate --watch DIR ADDR — следить за раскладкой окна-получателя
+#   whisper-dictate --sync [DELAY]   — пересчитать состояние индикатора в баре
+#                                   (чинит зависший спиннер, если такое случится)
+#   whisper-dictate --cancel [WHAT]  — отмена: recording (выбросить текущую
+#                                   запись), queue (выбросить всё, что ждёт,
+#                                   обрабатывается или ждёт возврата в окно)
+#                                   или all (по умолчанию)
+#   whisper-dictate --run-pending-watcher — следить за $PENDING_DIR (см. пункт 4
+#                                   выше); запускается сам собой, руками не
+#                                   нужно
+#   whisper-dictate --set-lang LANG SCOPE ADDR CLASS — закрепить язык вывода
+#                                   (auto|ru|en|uk|de) за окном (SCOPE=window)
+#                                   или приложением (SCOPE=app); вызывается из
+#                                   попапа диктовки. Применяется сразу к
+#                                   текущей записи и к заданиям в очереди.
+#   whisper-dictate --effective-lang ADDR CLASS KEYMAP — какой язык получит
+#                                   окно (закрепление или раскладка)
+#   whisper-dictate --test [--full] — самопроверка установки (см. setup-core.fish)
+#   whisper-dictate --version
+#
+# Настройка: whisper-dictate-setup (GUI/TUI/CLI). Конфиг: /etc/whisper-dictate/
+# dictate.conf и ~/.config/whisper-dictate/{dictate.conf,secrets.env}.
+#
+# Переменные окружения для отладки:
+#   DICTATE_DRY_RUN=1  — не фокусировать окно и не жать Ctrl+V, только
+#                        записать в лог, что было бы вставлено.
+#   DICTATE_STT=local  — распознавать только локальным whisper, не трогая
+#                        облако (или DICTATE_STT=openrouter:<модель>).
+#   DICTATE_NO_MOD_WAIT=1 — не ждать отпускания модификаторов перед вставкой
+#                        (пункт 5 выше). Аварийный выключатель на случай, если
+#                        какое-то устройство залипло и вставка перестала
+#                        происходить вовсе.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Путь к самому себе. Фоновые задачи запускаются как отдельные процессы
+# `fish $SELF --подкоманда`, а не через `функция &`: fish 4.8 в неинтерактивном
+# режиме НЕ форкает на фон ни вызов функции, ни блок begin/end — они просто
+# выполняются синхронно, а $last_pid остаётся пустым (проверено). В фон уходит
+# только внешняя команда, поэтому внешней командой тут работает сам скрипт.
+set -g SELF (realpath (status filename))
+
+# Каталог с библиотекой (common.fish, setup-core.fish, dictate-split.py):
+# $WHISPER_DICTATE_LIBDIR > ../lib рядом со скриптом (запуск из репозитория)
+# > /usr/lib/whisper-dictate (установленный пакет).
+set -g WD_LIBDIR ""
+for d in "$WHISPER_DICTATE_LIBDIR" (dirname $SELF)/../lib /usr/lib/whisper-dictate
+    if test -n "$d"; and test -f $d/common.fish
+        set -g WD_LIBDIR (realpath $d)
+        break
+    end
+end
+if test -z "$WD_LIBDIR"
+    echo "whisper-dictate: не найден common.fish (ожидается в /usr/lib/whisper-dictate)" >&2
+    exit 1
+end
+source $WD_LIBDIR/common.fish
+
+set -g DICT_DIR ~/.cache/dictate
+set -g LOCKDIR $DICT_DIR/recording.lock   # идёт запись (создаётся атомарным mkdir)
+set -g QUEUE_DIR $DICT_DIR/queue          # задания, ждущие распознавания
+set -g WORKER_LOCK $DICT_DIR/worker.lock  # единственный разбирающий очередь
+set -g PENDING_DIR $DICT_DIR/pending      # готовый текст, ждущий, пока пользователь сам
+                                           # вернётся в окно-получатель (см. ниже)
+set -g PENDING_WATCHER_LOCK $DICT_DIR/pending_watcher.lock  # единственный следящий за PENDING_DIR
+# Через сколько секунд ожидания доставить текст принудительно (фокус туда-обратно,
+# как раньше), если пользователь так и не вернулся в окно сам. 15 минут — с запасом:
+# не хочется дёргать фокус на записи, к которой человек скорее всего ещё вернётся,
+# но и не хочется, чтобы готовый текст ждал часами и потерялся из виду насовсем.
+set -g PENDING_TIMEOUT_SECONDS (wd_conf PENDING_TIMEOUT_SECONDS 900)
+# Сколько ждать, пока пользователь отпустит зажатые модификаторы, прежде чем
+# отправлять Ctrl+V (подробности — в комментарии к dictate_mods_held).
+set -g MOD_WAIT_SECONDS (wd_conf MOD_WAIT_SECONDS 6)
+set -g SEQ_FILE $DICT_DIR/seq             # счётчик номеров заданий
+set -g SEQ_LOCK $DICT_DIR/seq.lock
+set -g STATE_LOCK $DICT_DIR/state.lock
+set -g LEGACY_LOCKDIR ~/.cache/dictate.lock
+
+# Бинарник и модели — из конфига (см. /etc/whisper-dictate/dictate.conf).
+# Имя модели без «/» ищется в MODEL_DIR; в $PATH ищется и whisper-cli.
+set -g MODEL_DIR (wd_conf MODEL_DIR ~/.local/share/whisper-dictate/models)
+set -g WHISPER_BIN (wd_conf WHISPER_BIN whisper-cli)
+if not string match -q '*/*' -- $WHISPER_BIN
+    set -g WHISPER_BIN (command -v $WHISPER_BIN; or echo /usr/bin/$WHISPER_BIN)
+end
+function dictate_model_path --argument-names name
+    string match -q '*/*' -- $name; and echo $name; or echo $MODEL_DIR/$name
+end
+set -g MODEL (dictate_model_path (wd_conf MODEL ggml-large-v3-turbo.bin))
+set -g VAD_MODEL (dictate_model_path (wd_conf VAD_MODEL ggml-silero-v5.1.2.bin))
+
+# ── защита от падения видеокарты на длинной записи ──────────────────────────
+# Диагноз (08.09.2026, ядро): длинный проход whisper по видеокарте вешает
+# очередь вычислений amdgpu — `ring comp_1.2.0 timeout ... Process whisper-cli`,
+# сбросить одну очередь не удаётся, драйвер сбрасывает всю карту целиком
+# («VRAM is lost due to GPU reset»), после чего Hyprland получает
+# EGL_BAD_PARAMETER и падает по ассерту. Дело не в переполнении видеопамяти:
+# модель занимает ~1.6 ГБ из 16 ГБ. Отсюда три меры ниже.
+#
+# 1. Длинную запись режем на куски (dictate-split.py, по паузам в речи) —
+#    короткий проход вешает карту заметно реже, и потеря одного куска не
+#    уносит с собой всю диктовку.
+set -g SPLIT_SCRIPT (wd_conf SPLIT_SCRIPT $WD_LIBDIR/dictate-split.py)
+set -g CHUNK_SECONDS (wd_conf CHUNK_SECONDS 120)
+# 2. Упавший whisper повторяем: если карта пережила сброс, вторая попытка
+#    обычно проходит. Пауза между попытками — чтобы дать драйверу очнуться.
+set -g WHISPER_ATTEMPTS (wd_conf WHISPER_ATTEMPTS 2)
+set -g WHISPER_RETRY_DELAY (wd_conf WHISPER_RETRY_DELAY 4)
+# 3. Что успели распознать — сразу на диск, а не только в памяти процесса.
+#    Если сессия умрёт вместе с Hyprland, текст переживёт её здесь.
+set -g PARTIAL_DIR $DICT_DIR/partial   # накопленный текст незаконченного задания
+set -g FAILED_DIR $DICT_DIR/failed     # записи, которые whisper так и не осилил
+set -g CHUNKS_DIR $DICT_DIR/chunks     # куски нарезанной записи
+set -g STATE_FILE (wd_conf STATE_FILE ~/.local/state/quickshell/states.json)
+set -g LOG_FILE (wd_conf LOG_FILE ~/.local/state/dictate/dictate.log)
+
+# ── закреплённый язык вывода ────────────────────────────────────────────────
+# Язык из раскладки (пункт 2 в шапке) можно перебить вручную из попапа
+# диктовки: `whisper-dictate --set-lang`. Закрепление живёт в двух местах:
+#   byAddr  — за конкретным окном (адрес Hyprland; живёт, пока живо окно);
+#   byClass — за приложением целиком (class окна; переживает перезапуски).
+# Окно важнее приложения. Значение "auto" у окна значит «у этого окна —
+# раскладка, даже если приложение закреплено». Лежит в ~/.local/state, а не в
+# ~/.cache: закрепление за приложением — настройка, а не кэш.
+set -g PINS_FILE ~/.local/state/dictate/lang-pins.json
+set -g PINS_LOCK $DICT_DIR/pins.lock
+# Под этим локом меняют job-файлы: воркер удаляет готовое задание, а
+# --set-lang переписывает язык ещё не обработанного. Без лока переписанный
+# файл мог бы воскреснуть уже после удаления — и текст вставился бы дважды.
+set -g JOBS_LOCK $DICT_DIR/jobs.lock
+set -g DICTATE_LANGS ru en uk de
+
+# ── распознавание ───────────────────────────────────────────────────────────
+# Подсказка распознавателю: термины, которые иначе превращаются в кашу
+# кириллицей ("хайпрленд", "квикшелл"). Её получают и локальный whisper
+# (--prompt), и облачная модель (поле prompt). Переопределяется файлом
+# ~/.config/dictate/prompt.txt — чтобы дополнять словарь без правки скрипта.
+# Написана обычной фразой, а не списком: whisper на тишине иногда выдаёт
+# подсказку обратно, и тогда её срезает dictate_strip_hallucinations.
+set -g DICTATE_PROMPT_FILE $WD_USER_DIR/prompt.txt
+if not test -e $DICTATE_PROMPT_FILE; and test -e ~/.config/dictate/prompt.txt
+    set -g DICTATE_PROMPT_FILE ~/.config/dictate/prompt.txt
+end
+set -g DICTATE_PROMPT_DEFAULT (wd_conf PROMPT "Говорю про Hyprland, Quickshell, Wayland, QML, Lua, fish, OpenCode, Claude, GitHub, API, Telegram, Discord, Obsidian, DeepL и OpenRouter.")
+# Облачное распознавание (.apiKeys.dictationStt в кейринге): "local" —
+# только whisper.cpp; "openrouter:<модель>" — модель через OpenRouter
+# /audio/transcriptions, куски параллельно, упавший кусок дораспознаётся
+# локально. Пусто — значит этот дефолт.
+set -g STT_DEFAULT openrouter:openai/gpt-4o-transcribe
+
+# Дефолт; реальное значение берётся из кейринга (.apiKeys.geminiDictationModel),
+# чтобы менять модель через set-api-key.fish / настройки Quickshell без правки скрипта.
+# gemini-flash-latest — это АЛИАС, который Google сам двигает на актуальную
+# flash-модель. Именно поэтому он тут: конкретные версии периодически
+# перестают выдаваться новым проектам (так умер gemini-2.5-flash).
+set -g GEMINI_MODEL_DEFAULT (wd_conf GEMINI_MODEL_DEFAULT gemini-flash-latest)
+# Резервная модель — если основная 3 раза подряд отвечает "перегружена"
+# (503 UNAVAILABLE) или упирается в лимит запросов (429), пробуем эту.
+# У flash-lite отдельный от flash пул мощностей на стороне Google, поэтому
+# спайк нагрузки на flash не обязательно затрагивает lite.
+# gemini-flash-lite-latest — тоже Google-managed алиас (не конкретная версия),
+# по той же причине, что и GEMINI_MODEL_DEFAULT: gemini-2.5-flash-lite здесь
+# стоял раньше и умер для проекта ровно так же, как раньше умер gemini-2.5-flash.
+set -g GEMINI_MODEL_FALLBACK gemini-flash-lite-latest
+
+# Whisper на тишине и шуме дописывает фразы из субтитров YouTube, на которых
+# обучался: "Продолжение следует...", "Субтитры сделал DimaTorzok" и т.п. Это
+# не сказанный текст, и он не должен ни вставляться, ни уезжать в перевод —
+# иначе Gemini честно переведёт "Продолжение следует" в "To be continued...".
+# В списке — только заведомо чужие фразы; хвостовая пунктуация срезается
+# отдельно, поэтому здесь её нет.
+set -g HALLUCINATION_PHRASES \
+    "Продолжение следует" \
+    "Продолжение в следующей серии" \
+    "Субтитры сделал DimaTorzok" \
+    "Субтитры создавал DimaTorzok" \
+    "Субтитры делал DimaTorzok" \
+    "Редактор субтитров А.Синецкая" \
+    "Корректор А.Егорова" \
+    "Спасибо за просмотр" \
+    "Подписывайтесь на канал" \
+    "Ставьте лайки и подписывайтесь на канал" \
+    "To be continued" \
+    "Thanks for watching" \
+    "Subtitles by the Amara.org community"
+
+# Те же титры, но семейством: фамилия у "редактора субтитров" каждый раз
+# другая, точным списком это не покрыть. Поймано на живой диктовке — прошло
+# "Редактор субтитров А. Сёмкин", хотя в списке выше стоит другая фамилия.
+# Это regex-фрагменты (не экранируются), срезаются так же — только с конца.
+# Хвост имени описан узко — до трёх слов, каждое с заглавной (инициалы и
+# фамилии: "А. Сёмкин", "Иванов И.И."). Широкое [^.!?]* здесь пробовал: оно
+# сожрало живую речь "Мы обсудили редактор субтитров как инструмент и это
+# важно" -> "Мы обсудили". Пропустить титры не страшно, срезать сказанное —
+# страшно, поэтому шаблон обязан быть заведомо уже, чем кажется нужным.
+set -g HALLUCINATION_PATTERNS \
+    'Редактор\s+субтитров(?:\s+\p{Lu}[\p{L}.\-]*){0,3}' \
+    'Корректор(?:\s+\p{Lu}[\p{L}.\-]*){1,3}' \
+    'Субтитр(?:ы|ов)\s+(?:сделал|создавал|делал|подготовил|редактировал)(?:\s+\p{Lu}[\p{L}.\-]*){0,3}' \
+    'Subtitle\s+Editor:(?:\s+\p{Lu}[\p{L}.\-]*){0,3}'
+
+
+# ───────────────────────────── вспомогательное ─────────────────────────────
+
+function dictate_log
+    echo (date "+%Y-%m-%d %H:%M:%S") "$argv" >> $LOG_FILE
+end
+
+function dictate_secrets
+    # Все ключи и настройки провайдеров — один JSON {apiKeys: {...}}.
+    # Слои и приоритет описаны в lib/common.fish (wd_secrets_json): окружение
+    # > ~/.config/whisper-dictate/secrets.env > libsecret.
+    wd_secrets_json
+end
+
+function dictate_kill_pid --argument-names pid sig
+    if test -z "$pid"
+        return
+    end
+    kill -$sig $pid 2>/dev/null
+    # Ждём, пока процесс реально выйдет (pw-record на SIGINT дописывает
+    # заголовок WAV), а не спим фиксированно: обычно это ~20-50 мс, и
+    # раньше на каждой остановке уходило 0.2 + 0.3 с впустую. Потолок 2 с.
+    for i in (seq 100)
+        kill -0 $pid 2>/dev/null; or return
+        sleep 0.02
+    end
+    kill -9 $pid 2>/dev/null
+end
+
+function dictate_kill_lock
+    if test -f $LOCKDIR/pw.pid
+        dictate_kill_pid (cat $LOCKDIR/pw.pid) INT
+    end
+    # Снятие каталога-локи заодно гасит watcher раскладки: он проверяет
+    # наличие каталога на каждой итерации и выходит сам.
+    rm -rf $LOCKDIR
+end
+
+function dictate_next_seq
+    # Номер задания. Под flock, потому что два «стопа» подряд могут прийти из
+    # разных процессов. Ширина фиксированная — чтобы сортировка имён файлов
+    # в очереди совпадала с числовым порядком.
+    env SQ="$SEQ_FILE" flock $SEQ_LOCK sh -c '
+        n=$(cat "$SQ" 2>/dev/null)
+        case "$n" in ""|*[!0-9]*) n=0 ;; esac
+        n=$((n + 1))
+        printf "%s\n" "$n" > "$SQ"
+        printf "%06d\n" "$n"
+    '
+end
+
+
+function dictate_strip_hallucinations --argument-names text
+    # Срезаем известные фразы-галлюцинации с КОНЦА текста (и целиком, если
+    # весь ответ whisper состоит из одной такой фразы). Только с конца:
+    # именно туда whisper их дописывает, а в середине реальной речи такая
+    # фраза скорее всего сказана человеком. Пунктуация самой фразы съедается,
+    # точка предыдущего предложения — нет.
+    set -l cleaned (string trim -- "$text" | string collect)
+    set -l again true
+    while test "$again" = true
+        set again false
+        # Точные фразы экранируются, шаблоны идут как есть.
+        set -l candidates
+        for phrase in $HALLUCINATION_PHRASES
+            set -a candidates (string escape --style=regex -- "$phrase")
+        end
+        for pat in $HALLUCINATION_PATTERNS
+            set -a candidates $pat
+        end
+
+        for phrase in $candidates
+            # (*UCP) обязателен: без него (?i) не работает для кириллицы —
+            # PCRE2 без Unicode-свойств не знает, что "П" и "п" одна буква.
+            # (?:^|(?<=[.!?…])\s*) — совпадение засчитывается только с
+            # начала строки или начала нового предложения. Точка предыдущего
+            # предложения при этом остаётся на месте (lookbehind её не ест).
+            # (?<=[.!?…\n]) — граница предложения ИЛИ конец строки: whisper
+            # часто кладёт галлюцинацию отдельным сегментом с новой строки без
+            # предшествующей точки (поймано на живой диктовке: "...на годе 2\n
+            # Продолжение следует..." — без \n в классе символов lookbehind не
+            # срабатывал, и хвост не срезался).
+            set -l pattern '(*UCP)(?i)(?:^|(?<=[.!?…\n]))\s*'$phrase'[\s.!?…]*$'
+            set -l stripped (string replace -r -- "$pattern" '' "$cleaned" | string collect)
+            if test "$stripped" != "$cleaned"
+                set cleaned (string trim -- "$stripped" | string collect)
+                set again true
+            end
+        end
+    end
+    # Подсказка-словарь (см. $DICTATE_PROMPT_DEFAULT), выданная обратно
+    # целиком вместо речи, — тоже не сказанный текст.
+    set -l prompt (dictate_prompt)
+    if test -n "$prompt"
+        set -l a (string lower -- (string trim -c ' .!?…' -- "$cleaned") | string collect)
+        set -l b (string lower -- (string trim -c ' .!?…' -- "$prompt") | string collect)
+        test "$a" = "$b"; and set cleaned ""
+    end
+    printf '%s' "$cleaned"
+end
+
+function dictate_prompt
+    if test -s $DICTATE_PROMPT_FILE
+        string trim -- (cat $DICTATE_PROMPT_FILE | string collect) | string collect
+    else
+        printf '%s' "$DICTATE_PROMPT_DEFAULT"
+    end
+end
+
+
+# ──────────────────────────── состояние для бара ───────────────────────────
+
+function dictate_state_set --argument-names dict_json
+    # states.json пишут и Quickshell, и этот скрипт (возможно, в нескольких
+    # экземплярах сразу), поэтому read-modify-write идёт под flock.
+    env DJ="$dict_json" SF="$STATE_FILE" flock $STATE_LOCK sh -c '
+        [ -f "$SF" ] || printf "{}\n" > "$SF"
+        jq --argjson d "$DJ" ".dictation = \$d" "$SF" > "$SF.tmp" 2>/dev/null \
+            && [ -s "$SF.tmp" ] && mv "$SF.tmp" "$SF"
+    '
+end
+
+function dictate_sync_state
+    # Состояние индикатора — чистая функция от файлов на диске (лока записи +
+    # содержимое очереди), а не накопленный набор флагов. Поэтому его можно
+    # пересчитать и переписать в любой момент, и оно всегда будет верным:
+    # ровно это спасает от гонки с Quickshell, который тоже пишет states.json
+    # и может затереть наш апдейт своей копией (см. dictate_reassert_state).
+    set -l active false
+    set -l started 0
+    set -l target ""
+    set -l target_addr ""
+    set -l target_class ""
+    set -l lang ""
+    set -l lang_pinned ""
+
+    if test -f $LOCKDIR/pw.pid; and kill -0 (cat $LOCKDIR/pw.pid 2>/dev/null) 2>/dev/null
+        set active true
+        set started (cat $LOCKDIR/started_at 2>/dev/null)
+        set target (cat $LOCKDIR/target_title 2>/dev/null)
+        set target_addr (cat $LOCKDIR/target_addr 2>/dev/null)
+        set target_class (cat $LOCKDIR/target_class 2>/dev/null)
+        set lang (cat $LOCKDIR/lang 2>/dev/null)
+        set lang_pinned (cat $LOCKDIR/lang_pinned 2>/dev/null)
+    end
+    # Откуда взялся язык у каждой строки очереди: "window" / "app" / "" —
+    # попап по этому показывает булавку и выбранную область закрепления.
+    set -l pins_json (dictate_pins_read)
+    if test -z "$started"; or string match -qr '[^0-9]' -- "$started"
+        set started 0
+    end
+
+    # Задания, ждущие whisper/перевод ($QUEUE_DIR) — первое из них уже
+    # в работе (status "processing"), остальные — "queued". Отдельно —
+    # готовые тексты, ждущие естественного возврата в своё окно ($PENDING_DIR,
+    # status "ready", см. пункт 4 в шапке файла). Оба списка идут в один
+    # `queue` для попапа виджета: каждая строка сама несёт свой статус,
+    # достаточно поменять иконку в QML по полю status, без второй секции.
+    set -l jobs (dictate_list_jobs)
+    set -l pending (count $jobs)
+    set -l queue_json "[]"
+    if test $pending -gt 0
+        set -l q (cat $jobs 2>/dev/null | jq -s -c --argjson pins "$pins_json" \
+            '[.[] | {target: (.target_title // ""), lang: (.lang // ""), cls: (.target_class // ""), addr: (.target_addr // ""), status: "queued",
+                     pinned: (if (.target_addr // "") != "" and ($pins.byAddr[.target_addr] // "") == "auto" then ""
+                              elif (.target_addr // "") != "" and ($pins.byAddr[.target_addr] // "") != "" then "window"
+                              elif (.target_class // "") != "" and ($pins.byClass[.target_class] // "") != "" then "app"
+                              else "" end)}]
+             | if length > 0 then .[0].status = "processing" else . end' 2>/dev/null)
+        test -n "$q"; and set queue_json $q
+    end
+
+    set -l ready_files (dictate_list_pending)
+    set -l ready (count $ready_files)
+    set -l ready_json "[]"
+    if test $ready -gt 0
+        set -l rj (cat $ready_files 2>/dev/null | jq -s -c             '[.[] | {target: (.title // ""), lang: (.lang // ""), cls: (.cls // ""), addr: (.addr // ""), status: "ready"}]' 2>/dev/null)
+        test -n "$rj"; and set ready_json $rj
+    end
+
+    set -l combined_queue (jq -n -c --argjson a "$queue_json" --argjson b "$ready_json" '$a + $b' 2>/dev/null)
+    test -z "$combined_queue"; and set combined_queue "[]"
+
+    set -l dict_json (jq -n -c \
+        --argjson active $active \
+        --argjson startedAt $started \
+        --argjson pending $pending \
+        --argjson ready $ready \
+        --argjson queue "$combined_queue" \
+        --arg target "$target" \
+        --arg targetAddr "$target_addr" \
+        --arg targetClass "$target_class" \
+        --arg lang "$lang" \
+        --arg langPinned "$lang_pinned" \
+        '{active: $active, startedAt: $startedAt, processing: ($pending > 0), pending: $pending, ready: $ready, target: $target, targetAddr: $targetAddr, targetClass: $targetClass, lang: $lang, langPinned: $langPinned, queue: $queue}' 2>/dev/null)
+
+    test -n "$dict_json"; and dictate_state_set "$dict_json"
+end
+
+function dictate_reassert_state
+    # Quickshell перечитывает states.json по watch'у и через ~100 мс пишет его
+    # обратно целиком из своей копии адаптера. Если наш апдейт попал ровно в
+    # это окно, он потеряется и в баре останется висеть спиннер. Повторная
+    # синхронизация через секунду это чинит — и она безопасна, потому что
+    # состояние пересчитывается от файлов, а не «догадывается».
+    fish $SELF --sync 1 >/dev/null 2>&1 &
+end
+
+
+# ───────────────────────── окно-получатель и раскладка ─────────────────────
+
+function dictate_current_keymap
+    hyprctl devices -j 2>/dev/null \
+        | jq -r '([.keyboards[] | select(.main == true) | .active_keymap] | first) // .keyboards[0].active_keymap // empty' 2>/dev/null
+end
+
+function dictate_lang_code --argument-names keymap
+    # Английская раскладка на окне-получателе = «хочу английский текст»
+    # (русская речь уедет в Gemini на перевод). Всё остальное — как есть.
+    if string match -q -i 'english*' -- "$keymap"
+        echo en
+    else
+        echo ru
+    end
+end
+
+function dictate_pins_read
+    # Всегда валидный JSON с обоими разделами — даже если файла ещё нет.
+    set -l j (jq -c '{byAddr: (.byAddr // {}), byClass: (.byClass // {})}' $PINS_FILE 2>/dev/null)
+    test -n "$j"; or set j '{"byAddr":{},"byClass":{}}'
+    printf '%s' "$j"
+end
+
+function dictate_pin_lookup --argument-names addr class
+    # Печатает "<язык>\t<window|app>", если язык закреплён, и ничего, если
+    # язык должен идти от раскладки. Окно важнее приложения; "auto" у окна —
+    # явное «по раскладке», оно перебивает закрепление приложения.
+    dictate_pins_read | jq -r --arg a "$addr" --arg c "$class" '
+        if $a != "" and (.byAddr[$a] // "") != "" then
+            (if .byAddr[$a] == "auto" then empty else "\(.byAddr[$a])\twindow" end)
+        elif $c != "" and (.byClass[$c] // "") != "" then "\(.byClass[$c])\tapp"
+        else empty end' 2>/dev/null
+end
+
+function dictate_effective_lang --argument-names addr class keymap
+    # Итоговый язык задания/записи: закрепление, иначе раскладка.
+    set -l pin (dictate_pin_lookup "$addr" "$class")
+    if test -n "$pin"
+        set -l p (string split \t -- "$pin")
+        echo $p[1]
+    else
+        dictate_lang_code "$keymap"
+    end
+end
+
+function dictate_set_lang --argument-names lang scope addr class
+    # Точка входа попапа: закрепить (или снять) язык и сразу применить его к
+    # текущей записи и к ещё не распознанным заданиям того же окна/приложения.
+    if not contains -- "$lang" auto $DICTATE_LANGS
+        echo "unknown language: $lang (auto $DICTATE_LANGS)" >&2
+        return 2
+    end
+    if not contains -- "$scope" window app
+        echo "unknown scope: $scope (window|app)" >&2
+        return 2
+    end
+    if test "$scope" = window; and test -z "$addr"
+        echo "scope=window needs a window address" >&2
+        return 2
+    end
+    if test "$scope" = app; and test -z "$class"
+        echo "scope=app needs a window class" >&2
+        return 2
+    end
+
+    mkdir -p (dirname $PINS_FILE) 2>/dev/null
+    # Адреса закрытых окон вычищаются здесь же: Hyprland может когда-нибудь
+    # переиспользовать адрес, и чужое старое закрепление прилипло бы к
+    # новому окну.
+    set -l live (hyprctl clients -j 2>/dev/null | jq -c '[.[].address]' 2>/dev/null)
+    test -n "$live"; or set live null
+    env PF="$PINS_FILE" L="$lang" S="$scope" A="$addr" C="$class" LIVE="$live" flock $PINS_LOCK sh -c '
+        [ -s "$PF" ] || printf "{}\n" > "$PF"
+        jq --arg l "$L" --arg s "$S" --arg a "$A" --arg c "$C" --argjson live "$LIVE" "
+            .byAddr = (.byAddr // {}) | .byClass = (.byClass // {})
+            | if \$live != null then .byAddr |= with_entries(select(.key as \$k | \$live | index(\$k))) else . end
+            | if \$s == \"window\" then
+                  (if \$l != \"auto\" then .byAddr[\$a] = \$l
+                   # «Авто» для окна: если приложение закреплено, окну нужен
+                   # явный auto, иначе закрепление приложения его перебьёт.
+                   elif (\$c != \"\" and (.byClass[\$c] // \"\") != \"\") then .byAddr[\$a] = \"auto\"
+                   else del(.byAddr[\$a]) end)
+              else
+                  (if \$l != \"auto\" then .byClass[\$c] = \$l else del(.byClass[\$c]) end)
+              end" "$PF" > "$PF.tmp" && [ -s "$PF.tmp" ] && mv "$PF.tmp" "$PF"
+    '
+    dictate_log "SET-LANG $lang scope=$scope addr=$addr class=$class"
+
+    # Текущая запись — если она в затронутое окно/приложение.
+    if test -d $LOCKDIR
+        set -l t_addr (cat $LOCKDIR/target_addr 2>/dev/null)
+        set -l t_class (cat $LOCKDIR/target_class 2>/dev/null)
+        if begin; test -n "$addr"; and test "$t_addr" = "$addr"; end
+            or begin; test "$scope" = app; and test -n "$class"; and test "$t_class" = "$class"; end
+            set -l pin (dictate_pin_lookup "$t_addr" "$t_class")
+            if test -n "$pin"
+                set -l p (string split \t -- "$pin")
+                echo $p[1] > $LOCKDIR/lang
+                echo $p[2] > $LOCKDIR/lang_pinned
+            else
+                rm -f $LOCKDIR/lang_pinned
+                dictate_lang_code (cat $LOCKDIR/keymap 2>/dev/null) > $LOCKDIR/lang
+            end
+        end
+    end
+
+    # Задания в очереди (в том числе то, что распознаётся прямо сейчас:
+    # dictate_process_job перечитывает язык после распознавания). Готовые
+    # тексты в $PENDING_DIR уже переведены — их язык не меняется.
+    for job in (dictate_list_jobs)
+        env J="$job" A="$addr" C="$class" S="$scope" PF="$PINS_FILE" SELF="$SELF" flock $JOBS_LOCK sh -c '
+            [ -f "$J" ] || exit 0
+            ja=$(jq -r ".target_addr // empty" "$J")
+            jc=$(jq -r ".target_class // empty" "$J")
+            if [ -n "$A" ] && [ "$ja" = "$A" ]; then :
+            elif [ "$S" = app ] && [ -n "$C" ] && [ "$jc" = "$C" ]; then :
+            else exit 0; fi
+            km=$(jq -r ".keymap // empty" "$J")
+            nl=$(fish "$SELF" --effective-lang "$ja" "$jc" "$km")
+            [ -n "$nl" ] || exit 0
+            jq -c --arg l "$nl" ".lang = \$l" "$J" > "$J.tmp" && [ -s "$J.tmp" ] && mv "$J.tmp" "$J"
+        '
+    end
+
+    dictate_sync_state
+    dictate_reassert_state
+end
+
+function dictate_record_layout --argument-names lockdir keymap
+    test -n "$keymap"; or return
+    test -d $lockdir; or return
+    set -l prev (cat $lockdir/keymap 2>/dev/null)
+    test "$prev" = "$keymap"; and return
+    echo $keymap > $lockdir/keymap
+    # Закреплённый язык раскладкой не перебивается: раскладку запоминаем
+    # (пригодится, если закрепление снимут), язык — нет.
+    if test -f $lockdir/lang_pinned
+        dictate_log "layout of target window -> $keymap (language pinned, ignored)"
+        return
+    end
+    dictate_lang_code "$keymap" > $lockdir/lang
+    dictate_log "layout of target window -> $keymap ("(cat $lockdir/lang 2>/dev/null)")"
+    dictate_sync_state
+end
+
+function dictate_layout_watcher --argument-names lockdir target_addr
+    # Опрос, а не подписка на события Hyprland: один hyprctl --batch + один jq
+    # раз в 0.3 с (замерено ~3 мс на итерацию), зато watcher сам умирает в
+    # течение 0.3 с после снятия $lockdir — не надо ловить его pid, и после
+    # него не остаётся осиротевших процессов-подписчиков.
+    while test -d $lockdir
+        set -l snap (hyprctl --batch "j/activewindow;j/devices" 2>/dev/null \
+            | jq -s -r '[(.[0].address // ""), (([.[1].keyboards[] | select(.main == true) | .active_keymap] | first) // .[1].keyboards[0].active_keymap // "")] | @tsv' 2>/dev/null)
+        if test -n "$snap"
+            set -l parts (string split \t -- "$snap")
+            # Раскладку засчитываем, только если прямо сейчас сфокусировано
+            # окно-получатель (см. пункт 2 в шапке файла).
+            if test -z "$target_addr"; or test "$parts[1]" = "$target_addr"
+                dictate_record_layout $lockdir "$parts[2]"
+            end
+        end
+        sleep 0.3
+    end
+end
+
+function dictate_window_exists --argument-names addr
+    test -n "$addr"; or return 1
+    set -l n (hyprctl clients -j 2>/dev/null | jq -r --arg a "$addr" '[.[] | select(.address == $a)] | length' 2>/dev/null)
+    test "$n" = "0"; and return 1
+    test -n "$n"
+end
+
+function dictate_focus --argument-names addr
+    # Тут Hyprland-форк с Lua-конфигом (hl.dsp.*, см.
+    # ~/.config/hypr/hyprland/keybinds.lua): классический синтаксис
+    # `dispatch focuswindow address:...` не парсится
+    # ('hl.dispatch: expected a dispatcher'). Рабочий эквивалент найден
+    # через `hyprctl eval` — интроспекцией принимаемых hl.dsp.focus ключей.
+    hyprctl dispatch "hl.dsp.focus({ window = \"address:$addr\" })" 2>&1
+end
+
+
+# ─────────────────────────────── перевод ───────────────────────────────────
+
+# Скрипт живёт в дереве Quickshell (им же пользуется переводчик в сайдбаре);
+# без Quickshell его ставит install.sh в ~/.local/share/dictate/scripts.
+# Необязательный: без него локальный перевод недоступен, и диктовка уходит
+# к DeepL/Gemini. Путь можно задать ключом TRANSLATE_SCRIPT в dictate.conf.
+set -g LOCAL_TRANSLATE_SCRIPT (wd_conf TRANSLATE_SCRIPT ~/.config/quickshell/ii/scripts/ai/local-translate.sh)
+
+function dictate_lang_name --argument-names lang
+    # Английское название языка — для промпта Gemini.
+    switch $lang
+        case en; echo English
+        case uk; echo Ukrainian
+        case de; echo German
+        case ru; echo Russian
+        case '*'; echo English
+    end
+end
+
+function dictate_translate_local --argument-names ru_text
+    # Бэкенд выбирается префиксом в .apiKeys.localTranslateModel (кейринг):
+    # "ollama:<имя>" — модель на GPU через Ollama (load -> answer -> unload,
+    # между вызовами в видеопамяти ничего не остаётся), "marian:<каталог>" —
+    # seq2seq-модель из ~/mt-models на CPU, через scripts/ai/marian-translate.py,
+    # то есть вообще без GPU. Тот же скрипт, что использует sidebar-переводчик
+    # с provider=local в ai-translate.sh, но модель у них теперь РАЗНАЯ:
+    # LOCAL_TRANSLATE_SLOT=dictation заставляет скрипт читать
+    # .apiKeys.dictationLocalModel вместо общего .apiKeys.localTranslateModel.
+    # Диктовке нужна быстрая CPU-модель на коротких фразах, боковой панели —
+    # более качественная GPU-модель на длинных вставках, одной настройкой это
+    # не покрывалось. Если своя настройка пуста, скрипт сам возьмёт общую.
+    test -x "$LOCAL_TRANSLATE_SCRIPT"; or return 1
+    env LOCAL_TRANSLATE_SLOT=dictation $LOCAL_TRANSLATE_SCRIPT Russian English "$ru_text" 2>/dev/null
+end
+
+function dictate_translate_deepl --argument-names ru_text lang
+    # DeepL — специализированный переводчик, а не языковая модель, поэтому у
+    # него нет ни отказов «не буду это переводить», ни лишних пояснений в
+    # ответе, ни выдуманного текста. Для диктовки это ровно то, что нужно.
+    # Бесплатный тариф — 500 000 СИМВОЛОВ в месяц (не запросов), примерно
+    # 500 диктовок средней длины.
+    set -l key (dictate_secrets | jq -r '.apiKeys.deepl // empty' 2>/dev/null)
+    if test -z "$key"
+        echo "ключ DeepL не задан (Настройки → API keys → DeepL)" > /tmp/dictate_last_error
+        return 1
+    end
+
+    # У бесплатных ключей суффикс ":fx", и живут они на ОТДЕЛЬНОМ хосте.
+    # Определяем хост по самому ключу, чтобы человеку не приходилось ещё и
+    # тариф выбирать в настройках руками.
+    set -l host https://api.deepl.com
+    if string match -q '*:fx' -- "$key"
+        set host https://api-free.deepl.com
+    end
+
+    # Коды DeepL: у английского обязателен вариант (EN-US), у остальных — нет.
+    set -l target EN-US
+    switch "$lang"
+        case uk; set target UK
+        case de; set target DE
+    end
+    set -l payload (jq -n --arg t "$ru_text" --arg tl "$target" \
+        '{text: [$t], source_lang: "RU", target_lang: $tl}' 2>/dev/null)
+    if test -z "$payload"
+        echo "не удалось собрать запрос к DeepL" > /tmp/dictate_last_error
+        return 1
+    end
+
+    # Три попытки: у DeepL бывает 429 (слишком часто) и 5xx, и оба лечатся
+    # обычным повтором с паузой. Ошибки ключа и квоты повтором не лечатся,
+    # поэтому на них выходим сразу — иначе диктовка молча ждёт впустую.
+    set -l attempt 1
+    set -l last_err ""
+    while test $attempt -le 3
+        set -l response (curl -s --max-time 12 "$host/v2/translate" \
+            -H "Authorization: DeepL-Auth-Key $key" \
+            -H "Content-Type: application/json" \
+            -X POST -d "$payload" 2>/dev/null)
+
+        set -l translated (echo "$response" | jq -r '.translations[0].text // empty' 2>/dev/null)
+        if test -n "$translated"
+            echo "$translated"
+            return 0
+        end
+
+        set last_err (echo "$response" | jq -r '.message // empty' 2>/dev/null)
+        if test -z "$last_err"
+            set last_err "нет ответа от DeepL (сеть/таймаут)"
+        end
+        dictate_log "deepl attempt $attempt/3 failed: $last_err"
+
+        # 456 — исчерпана квота месяца, 403 — неверный ключ. Повторять
+        # бессмысленно, и лучше быстро отдать русский текст, чем ждать.
+        if string match -qi '*quota*' -- "$last_err"; or string match -qi '*authorization*' -- "$last_err"
+            break
+        end
+
+        set attempt (math "$attempt + 1")
+        sleep 0.8
+    end
+
+    echo "DeepL: $last_err" > /tmp/dictate_last_error
+    return 1
+end
+
+function dictate_translate --argument-names ru_text lang
+    # Переключатель провайдера перевода читается из кейринга
+    # (.apiKeys.dictationProvider): "local" -> локальный офлайн-перевод
+    # (Ollama на GPU или Marian на CPU, см. dictate_translate_local),
+    # "deepl" -> DeepL API, что угодно ещё (включая пусто) -> Gemini.
+    # Язык — en/uk/de (см. $DICTATE_LANGS). Локальная модель умеет только
+    # ru->en, поэтому на остальных языках "local" уступает DeepL (если есть
+    # ключ) или Gemini.
+    test -n "$lang"; or set lang en
+    set -l provider (dictate_secrets | jq -r '.apiKeys.dictationProvider // empty' 2>/dev/null)
+    if test "$provider" = local
+        if test "$lang" = en
+            dictate_translate_local "$ru_text"
+            return $status
+        end
+        set -l has_deepl (dictate_secrets | jq -r '.apiKeys.deepl // empty' 2>/dev/null)
+        if test -n "$has_deepl"
+            set provider deepl
+        end
+    end
+    if test "$provider" = deepl
+        dictate_translate_deepl "$ru_text" "$lang"
+        return $status
+    end
+    # Read the keyring once. .apiKeys.geminiDictation is an OPTIONAL override:
+    # filling it in gives dictation its own Gemini project, isolated from the
+    # sidebar's and from shell-UI translation (Google's free-tier quota counts
+    # per project). Leaving it empty — the normal case — falls back to the one
+    # main Google key, so the key does not have to be pasted once per feature.
+    set -l secret (dictate_secrets | string collect)
+
+    set -l api_key (echo "$secret" | jq -r '.apiKeys.geminiDictation // .apiKeys.gemini // empty' 2>/dev/null)
+    if test -z "$api_key"
+        return 1
+    end
+
+    # Model name lives in the keyring too, so a Google-side deprecation is a
+    # settings change, not a script edit.
+    set -l model (echo "$secret" | jq -r '.apiKeys.geminiDictationModel // empty' 2>/dev/null)
+    if test -z "$model"
+        set model $GEMINI_MODEL_DEFAULT
+    end
+
+    # "__auto__" (Settings → API keys → Model → Auto): don't pin a name at
+    # all, ask Google what this key can actually run right now and take the
+    # first of our preferred models that's still on the list. Costs one extra
+    # request, and only on the auto path — a pinned model never pays for it.
+    # Any failure here (offline, geo-block, rate limit) just falls through to
+    # the normal default; auto must never be worse than not using auto.
+    set -l auto_mode false
+    set -l auto_cache $DICT_DIR/auto_model
+    if test "$model" = __auto__
+        set auto_mode true
+        # Кэш выбранной моделью, чтобы не ходить в сеть на каждой фразе:
+        # список моделей меняется раз в недели, а диктовка — раз в минуту.
+        # Плюс гео-блок Google тут срабатывает полосами, и без кэша каждая
+        # вторая диктовка молча откатывалась бы на дефолт.
+        set -l cache_file $DICT_DIR/auto_model
+        set -l cached ""
+        if test -f $cache_file
+            set -l cached_at (head -1 $cache_file 2>/dev/null)
+            set -l cached_model (tail -1 $cache_file 2>/dev/null)
+            if string match -qr '^[0-9]+$' -- "$cached_at"
+                and test (math (date +%s) - $cached_at) -lt 21600
+                and test -n "$cached_model"
+                set cached $cached_model
+            end
+        end
+
+        if test -n "$cached"
+            set model $cached
+            dictate_log "auto model: using cached $model"
+        else
+
+        set -l listed (curl -s --max-time 8 \
+            "https://generativelanguage.googleapis.com/v1beta/models" \
+            -H "x-goog-api-key: $api_key" \
+            | jq -r '.models[]? | select(.supportedGenerationMethods[]? == "generateContent") | .name | sub("^models/"; "")' 2>/dev/null)
+
+        set model ""
+        if test -n "$listed"
+            for candidate in $GEMINI_MODEL_DEFAULT $GEMINI_MODEL_FALLBACK
+                if contains -- $candidate $listed
+                    set model $candidate
+                    break
+                end
+            end
+            # None of ours available — take whatever the key does offer.
+            if test -z "$model"
+                set model $listed[1]
+            end
+        end
+        if test -z "$model"
+            # Ничего не выяснили — прежний дефолт. Кэш НЕ пишем: неудачную
+            # догадку незачем закреплять на шесть часов.
+            set model $GEMINI_MODEL_DEFAULT
+            dictate_log "auto model: lookup failed, falling back to $model"
+        else
+            printf '%s\n%s\n' (date +%s) "$model" > $cache_file
+            dictate_log "auto model: using $model"
+        end
+        end
+    end
+
+    set -l instruction "Translate the following Russian text to natural, fluent, idiomatic "(dictate_lang_name $lang)". Return ONLY the translated text — no quotes, no explanations, no notes."
+    set -l payload (jq -n --arg instr "$instruction" --arg text "$ru_text" \
+        '{contents: [{parts: [{text: ($instr + "\n\n" + $text)}]}], generationConfig: {temperature: 0.3}}')
+
+    # Gemini иногда отвечает 503 "high demand" / 429 rate-limit — это
+    # временная перегрузка на стороне Google, а не наша ошибка. Ретраим
+    # с бэкоффом на той же модели, а если и это не помогло — один раз
+    # пробуем резервную модель с отдельным пулом мощностей.
+    set -l models_to_try $model $GEMINI_MODEL_FALLBACK
+    set -l first_choice $model
+    set -l response ""
+    set -l translated ""
+    set -l last_err ""
+
+    for try_model in $models_to_try
+        set -l attempt 1
+        # Гео-блок и исчерпанная квота лечатся по-разному, поэтому и бюджет
+        # попыток у них раздельный. Блок — это маршрут: каждая новая попытка
+        # уходит через другой exit-узел, так что имеет смысл долбить часто и
+        # много. Квота — это счётчик на сутки: ждать секунды бессмысленно,
+        # быстрее сразу перейти на другую модель. Раньше был один общий счётчик
+        # на 3 попытки, и полоса блока съедала его целиком — перевод сдавался,
+        # и в окно уезжал русский текст вместо английского.
+        set -l geo_retries 0
+        while test $attempt -le 3
+            set response (curl -s --max-time 10 \
+                "https://generativelanguage.googleapis.com/v1beta/models/$try_model:generateContent" \
+                -H "x-goog-api-key: $api_key" \
+                -H "Content-Type: application/json" \
+                -X POST \
+                -d "$payload" 2>/dev/null)
+
+            set translated (echo "$response" | jq -r '.candidates[0].content.parts[0].text // empty' 2>/dev/null)
+            if test -n "$translated"
+                if test "$auto_mode" = true; and test "$try_model" != "$first_choice"
+                    printf '%s\n%s\n' (date +%s) "$try_model" > $auto_cache
+                    dictate_log "auto model: $first_choice failed, switched to $try_model and remembered it"
+                end
+                echo "$translated"
+                return 0
+            end
+
+            set -l err_status (echo "$response" | jq -r '.error.status // empty' 2>/dev/null)
+            set -l err_code (echo "$response" | jq -r '.error.code // empty' 2>/dev/null)
+            set last_err (echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
+            if test -z "$last_err"
+                set last_err "нет ответа от API (сеть/таймаут)"
+            end
+
+            # Пустой ответ — это не "плохая модель", а оборванное соединение:
+            # гео-блок Google в этой сети рубит часть запросов молча, без JSON.
+            # Раньше пустой ответ уезжал в ветку "постоянная ошибка" ниже и
+            # модель бросалась после ПЕРВОЙ же неудачи, поэтому перевод сдавался
+            # почти мгновенно и текст вставлялся по-русски.
+            # FAILED_PRECONDITION здесь — это гео-блок ("User location is not
+            # supported"), и он ТОЖЕ временный: в этой сети exit-нода меняется
+            # от запроса к запросу. Без него перевод сдавался с первого отказа
+            # и молча вставлял русский текст — ровно та жалоба, из-за которой
+            # это и нашлось.
+            # Гео-блок / оборванное соединение: короткая пауза, отдельный
+            # счётчик, попытки не тратятся из основного бюджета.
+            if test -z "$response"; or test "$err_status" = FAILED_PRECONDITION
+                if test $geo_retries -lt 8
+                    set geo_retries (math "$geo_retries + 1")
+                    sleep 0.6
+                    continue
+                end
+                break
+            end
+
+            # Перегрузка/квота: растущая пауза, но всего пара попыток — дальше
+            # выгоднее сменить модель, у неё свой суточный лимит.
+            if test "$err_status" = UNAVAILABLE; or test "$err_code" = 503; or test "$err_status" = RESOURCE_EXHAUSTED; or test "$err_code" = 429
+                sleep (math "1.2 * $attempt")
+                set attempt (math "$attempt + 1")
+                continue
+            end
+
+            # Ошибка не временная (плохой ключ, 404 модель и т.п.) — ретраить
+            # на этой модели бессмысленно, сразу пробуем следующую.
+            break
+        end
+    end
+
+    # Все модели и все попытки исчерпаны.
+    echo "$last_err" > /tmp/dictate_last_error
+    return 1
+end
+
+
+# ─────────────────────────────── вставка ───────────────────────────────────
+
+function dictate_wait_mods_released
+    # Ждёт, пока пользователь не отпустит все модификаторы (ctrl/shift/alt/
+    # super). Статус: 0 — было чисто сразу, 2 — пришлось подождать, но
+    # дождались, 1 — не дождались за $MOD_WAIT_SECONDS, 3 — проверить нечем.
+    # Коды 0 и 2 различаются не зря: если мы ждали, за это время фокус мог
+    # уехать в другое окно, и вызывающий обязан это перепроверить.
+    #
+    # ЗАЧЕМ ЭТО ВООБЩЕ НУЖНО. Вставка — это синтетический аккорд Ctrl+V с
+    # устройства ydotoold. Hyprland при разборе биндов складывает маску
+    # модификаторов со ВСЕХ клавиатур сразу (accumulateModsFromAllKBs), а не
+    # только с той, что прислала событие. Поэтому если в момент вставки
+    # пользователь физически держит SUPER, Hyprland видит не Ctrl+V, а
+    # CTRL+SUPER+V — то есть бинд "App: Volume mixer" из
+    # ~/.config/hypr/hyprland/keybinds.lua. Аккорд целиком съедается биндом,
+    # в окно не прилетает ничего, и вместо текста открывается pavucontrol-qt.
+    # Соседний SUPER+V (история буфера обмена в Quickshell) ломает вставку
+    # ровно так же. Воспроизводится один в один:
+    #   ydotool key 125:1; ydotool key 29:1 47:1 47:0 29:0; ydotool key 125:0
+    #
+    # Самый частый путь к этой ситуации — не SUPER+U, а pending-watcher:
+    # пользователь переключается в окно-получатель через SUPER+Tab или
+    # SUPER+<цифра>, watcher за свои 0.5с видит нужное окно и вставляет,
+    # пока SUPER ещё физически зажат.
+    #
+    # Состояние клавиш читаем прямо из ядра (ioctl EVIOCGKEY): ни Hyprland,
+    # ни ydotool наружу его не отдают.
+    if test -n "$DICTATE_NO_MOD_WAIT"
+        return 0
+    end
+    if not type -q python3
+        dictate_log "mod check unavailable (no python3) — pasting without it"
+        return 0
+    end
+
+    set -l out (python3 -c '
+import fcntl, glob, os, sys, time
+
+NB = (0x2ff + 7) // 8
+EVIOCGKEY = (2 << 30) | (NB << 16) | (0x45 << 8) | 0x18
+KEY_A = 30
+MODS = {29: "ctrl", 97: "ctrl", 42: "shift", 54: "shift",
+        56: "alt", 100: "alt", 125: "super", 126: "super"}
+
+
+def keyboards():
+    # Клавиатуру отличаем по sysfs, НЕ открывая устройство: close() на
+    # jack-detect устройствах звуковой карты стоит 8-13 мс каждый, и наивный
+    # обход всех /dev/input/event* выливается в 130 мс на ровном месте.
+    # Заодно отсеиваются геймпады и "consumer control": модификатор они
+    # рапортовать умеют, но клавиатурой для Hyprland не являются.
+    found = []
+    for node in sorted(glob.glob("/sys/class/input/event*")):
+        try:
+            words = open(node + "/device/capabilities/key").read().split()
+        except OSError:
+            continue
+        mask = int("".join(w.zfill(16) for w in words) or "0", 16)
+        if mask >> KEY_A & 1:
+            found.append("/dev/input/" + os.path.basename(node))
+    return found
+
+
+def held(devices):
+    down = set()
+    for path in devices:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            continue
+        try:
+            keys = bytearray(NB)
+            fcntl.ioctl(fd, EVIOCGKEY, keys)
+            for code, name in MODS.items():
+                if keys[code >> 3] >> (code & 7) & 1:
+                    down.add(name)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    return down
+
+
+timeout = float(sys.argv[1]) if len(sys.argv) > 1 else 6.0
+devices = keyboards()
+if not devices:
+    raise SystemExit(3)
+
+first = held(devices)
+if not first:
+    raise SystemExit(0)
+
+names = " ".join(sorted(first))
+deadline = time.time() + timeout
+while time.time() < deadline:
+    time.sleep(0.03)
+    if not held(devices):
+        print("%.2f %s" % (timeout - (deadline - time.time()), names))
+        raise SystemExit(2)
+print("%.2f %s" % (timeout, " ".join(sorted(held(devices) or first))))
+raise SystemExit(1)
+' $MOD_WAIT_SECONDS 2>/dev/null)
+    set -l st $status
+
+    # Python отдаёт одну строку "<секунды> <модификаторы>", режем её на слова.
+    set -l fields (string split " " -- "$out")
+    set -l secs $fields[1]
+    set -l mods (string join " " $fields[2..-1])
+
+    switch $st
+        case 2
+            dictate_log "paste waited $secs s for modifiers ($mods) to be released — a Hyprland bind would have eaten Ctrl+V"
+        case 1
+            dictate_log "modifiers still down after $secs s ($mods) — paste postponed"
+        case 3
+            dictate_log "mod check found no keyboard devices to read — pasting without it"
+            return 0
+    end
+    return $st
+end
+
+function dictate_paste --argument-names target_addr
+    # Статус 2 (в отличие от 1) означает "вставку сознательно отложили, текст
+    # цел" — вызывающий по нему НЕ ругается в уведомлении, а возвращает
+    # задание в $PENDING_DIR и пробует ещё раз позже.
+    dictate_wait_mods_released
+    set -l mod_wait $status
+    if test $mod_wait -eq 1
+        return 2
+    end
+    if test $mod_wait -eq 2; and test -n "$target_addr"
+        # Пока ждали отпускания клавиш, пользователь мог уйти в другое окно —
+        # вслепую жать Ctrl+V нельзя, текст уедет в чужое поле ввода.
+        set -l now (hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null)
+        if test -n "$now"; and test "$now" != "$target_addr"
+            dictate_log "focus moved to $now while waiting for modifiers — paste postponed"
+            return 2
+        end
+    end
+
+    # Основной способ — Ctrl+V как аккорд клавиш (LEFTCTRL=29, KEY_V=47) через
+    # ОДНО постоянное виртуальное устройство ydotoold.
+    #
+    # Почему именно ydotool, а не wtype: wtype открывает новое виртуальное
+    # устройство ввода на каждый вызов. Hyprland на появление устройства шлёт
+    # событие `activelayout`, а hyprland-per-window-layout (запускается из
+    # custom/execs.lua) слушает `activelayout` со всех устройств без фильтра —
+    # и запоминает раскладку, на которую упал сброс, как «раскладку» того
+    # окна, которое Hyprland в этот момент считает активным. То есть диктовка
+    # молча переписывает сохранённую раскладку постороннего окна (ровно об
+    # этом же комментарий в HyprlandXkb.qml — там фильтруют по "main": true).
+    # Устройство ydotoold открывается один раз на всю жизнь демона, поэтому
+    # этот сброс не происходит вообще. Так что ydotool здесь — ОСНОВНОЙ
+    # механизм, а не запасной: дело не в надёжности вставки (wtype вставляет
+    # нормально), а в том, чтобы не портить память раскладок.
+    if type -q ydotool
+        set -l yd_out (ydotool key --key-delay 0 29:1 47:1 47:0 29:0 2>&1)
+        set -l yd_status $status
+        dictate_log "ydotool key ctrl+v exit=$yd_status out=$yd_out"
+        if test $yd_status -eq 0
+            return 0
+        end
+    else
+        dictate_log "ydotool not found in PATH"
+    end
+
+    # Только запасной вариант: вставляет текст правильно, но ПОРТИТ
+    # запомненную раскладку какого-то окна (см. выше). Логируется громко:
+    # если эта строка появилась — вот и виновник «поехавшей» раскладки.
+    if type -q wtype
+        set -l wt_out (wtype -M ctrl -k v -m ctrl 2>&1)
+        set -l wt_status $status
+        dictate_log "FALLBACK: wtype ctrl+v (layout-corruption risk) exit=$wt_status out=$wt_out"
+        if test $wt_status -eq 0
+            return 0
+        end
+    else
+        dictate_log "wtype not found in PATH"
+    end
+
+    # Последняя попытка — на этой машине надёжной себя не показала.
+    # Синтаксис тот же Lua-форковый, что и у dictate_focus.
+    set -l ss_out (hyprctl dispatch 'hl.dsp.send_shortcut({ mods = "CTRL", key = "V" })' 2>&1)
+    set -l ss_status $status
+    dictate_log "sendshortcut ctrl+v exit=$ss_status out=$ss_out"
+    # Не отдаём наружу ss_status как есть: 2 у нас зарезервирована под
+    # "отложили вставку", а hyprctl теоретически может вернуть её как ошибку.
+    test $ss_status -eq 0; and return 0
+    return 1
+end
+
+function dictate_insert_text --argument-names text target_addr
+    if test -n "$DICTATE_DRY_RUN"
+        dictate_log "DRY_RUN: would insert into $target_addr: $text"
+        return 0
+    end
+
+    # Окно могли закрыть, пока крутился whisper. Вставлять «куда-нибудь» в
+    # этом случае нельзя — текст улетит в чужой чат или в игру, — поэтому
+    # оставляем его в буфере и говорим об этом вслух.
+    if test -n "$target_addr"; and not dictate_window_exists "$target_addr"
+        wl-copy -- "$text" 2>/dev/null
+        dictate_log "target window $target_addr is gone — text left in clipboard only"
+        notify-send "Диктовка" "Окно-получатель закрыто. Текст в буфере — вставь вручную (Ctrl+V)"
+        return 1
+    end
+
+    # Фокус после вставки НАМЕРЕННО остаётся на окне-получателе: текст приехал —
+    # и ты уже там, можно сразу дописывать руками и жать Enter, не ища окно
+    # глазами. Единственное исключение — если прямо сейчас идёт следующая
+    # запись: вырывать пользователя из активной диктовки нельзя, тогда фокус
+    # возвращается туда, где он был.
+    set -l restore ""
+    if test -n "$target_addr"
+        set -l cur (hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null)
+        if test -n "$cur"; and test "$cur" != "$target_addr"
+            if test -f $LOCKDIR/pw.pid; and kill -0 (cat $LOCKDIR/pw.pid 2>/dev/null) 2>/dev/null
+                set restore $cur
+            end
+        end
+        set -l fw_out (dictate_focus $target_addr)
+        dictate_log "focus address:$target_addr -> $fw_out"
+
+        # Фиксированной паузы 0.12с не всегда хватает: hl.dsp.focus иногда
+        # переключает окно/воркспейс с анимацией, и Ctrl+V улетает раньше, чем
+        # окно реально приняло клавиатурный фокус — тогда снаружи это
+        # выглядит как «окно открылось, а текст не вставился» (текст при этом
+        # остаётся в буфере, потому что wl-copy отрабатывает всегда). Поэтому
+        # ждём подтверждения через hyprctl activewindow, а не просто спим.
+        set -l focus_ok false
+        for i in (seq 1 10)
+            set -l now (hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null)
+            if test "$now" = "$target_addr"
+                set focus_ok true
+                break
+            end
+            sleep 0.05
+        end
+        if test "$focus_ok" = false
+            dictate_log "focus address:$target_addr did not settle within 500ms — pasting anyway"
+        end
+        sleep 0.07
+    end
+
+    set -l copy_out (wl-copy -- "$text" 2>&1)
+    dictate_log "wl-copy exit=$status out=$copy_out"
+
+    # Зеркалим текст ещё и в X11-буфер.
+    #
+    # ЗАЧЕМ. Hyprland в этой сессии не отдаёт буфер Wayland в XWayland:
+    # после wl-copy команда `wl-paste` текст видит, а `xsel --clipboard
+    # --output` возвращает пустоту. Обратное направление, X11 -> Wayland,
+    # работает — то, что положено через xsel, читается обоими.
+    #
+    # Почему это ломало диктовку именно в OpenCode: он читает из буфера
+    # ДВУМЯ РАЗНЫМИ путями — картинку напрямую через `wl-paste -t image/png`,
+    # а текст через библиотеку, которая зовёт `xsel --clipboard --output`.
+    # Поэтому скриншоты по Ctrl+V вставлялись, а надиктованный текст молча
+    # пропадал. В Claude Code TUI проблемы не было: тот TUI читает буфер иначе.
+    #
+    # Требует пакета xsel. Без него строка просто пропускается, и поведение
+    # остаётся прежним.
+    if type -q xsel
+        printf '%s' "$text" | xsel --clipboard --input 2>/dev/null
+        dictate_log "xsel mirror exit=$status"
+    else
+        dictate_log "xsel not installed — OpenCode will not see the dictated text"
+    end
+
+    sleep 0.1
+
+    dictate_paste "$target_addr"
+    set -l paste_status $status
+
+    if test -n "$restore"
+        # Пауза, чтобы Ctrl+V успел доехать до окна-получателя раньше, чем
+        # фокус уедет обратно.
+        sleep 0.25
+        set -l back_out (dictate_focus $restore)
+        dictate_log "focus back address:$restore -> $back_out"
+    end
+
+    if test $paste_status -eq 2
+        # Не ошибка: вставку отложили (зажаты модификаторы или уехал фокус).
+        # Ругаться уведомлением тут нельзя — текст никуда не делся, его просто
+        # вставят через мгновение, когда пользователь отпустит клавиши.
+        return 2
+    end
+    if test $paste_status -ne 0
+        notify-send "Диктовка" "Текст скопирован в буфер, вставь вручную (Ctrl+V) — авто-вставка не сработала"
+    end
+    return $paste_status
+end
+
+
+# ──────────────────────────── очередь заданий ──────────────────────────────
+
+function dictate_list_jobs
+    find $QUEUE_DIR -maxdepth 1 -type f -name '*.job' 2>/dev/null | sort
+end
+
+function dictate_list_pending
+    find $PENDING_DIR -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort
+end
+
+function dictate_claim_worker
+    # Атомарный mkdir — значит воркер ровно один. Если каталог остался от
+    # упавшего процесса, забираем его себе (pid внутри проверяется на живость).
+    if mkdir $WORKER_LOCK 2>/dev/null
+        echo $fish_pid > $WORKER_LOCK/pid
+        return 0
+    end
+    set -l pid (cat $WORKER_LOCK/pid 2>/dev/null)
+    if test -z "$pid"; or not kill -0 $pid 2>/dev/null
+        dictate_log "stale worker lock (pid=$pid) — taking over"
+        rm -rf $WORKER_LOCK 2>/dev/null
+        if mkdir $WORKER_LOCK 2>/dev/null
+            echo $fish_pid > $WORKER_LOCK/pid
+            return 0
+        end
+    end
+    return 1
+end
+
+function dictate_run_worker
+    if not dictate_claim_worker
+        # Очередь уже разбирает другой процесс — он подхватит и наше задание.
+        return
+    end
+
+    while true
+        set -l jobs (dictate_list_jobs)
+        if test (count $jobs) -eq 0
+            # Отпускаем лок и перепроверяем: задание могло приехать между
+            # выборкой списка и снятием лока. Если воркером за это время стал
+            # кто-то другой — уходим, очередь на нём.
+            rm -rf $WORKER_LOCK
+            set -l again (dictate_list_jobs)
+            test (count $again) -eq 0; and break
+            dictate_claim_worker; or break
+            continue
+        end
+
+        dictate_process_job $jobs[1]
+        # Под тем же локом, под которым --set-lang переписывает job-файлы.
+        flock $JOBS_LOCK rm -f $jobs[1]
+        dictate_sync_state
+    end
+
+    dictate_sync_state
+    dictate_reassert_state
+end
+
+
+# ──────────────────────── ожидание естественного возврата ──────────────────
+
+function dictate_claim_pending_watcher
+    # Та же схема, что у dictate_claim_worker: атомарный mkdir, мёртвый лок
+    # (pid не отвечает) забирается себе.
+    if mkdir $PENDING_WATCHER_LOCK 2>/dev/null
+        echo $fish_pid > $PENDING_WATCHER_LOCK/pid
+        return 0
+    end
+    set -l pid (cat $PENDING_WATCHER_LOCK/pid 2>/dev/null)
+    if test -z "$pid"; or not kill -0 $pid 2>/dev/null
+        dictate_log "stale pending-watcher lock (pid=$pid) — taking over"
+        rm -rf $PENDING_WATCHER_LOCK 2>/dev/null
+        if mkdir $PENDING_WATCHER_LOCK 2>/dev/null
+            echo $fish_pid > $PENDING_WATCHER_LOCK/pid
+            return 0
+        end
+    end
+    return 1
+end
+
+function dictate_run_pending_watcher
+    if not dictate_claim_pending_watcher
+        # Уже кто-то следит за $PENDING_DIR — он подхватит и наше задание.
+        return
+    end
+
+    while true
+        set -l files (dictate_list_pending)
+        if test (count $files) -eq 0
+            # Тот же приём, что в dictate_run_worker: отпускаем лок,
+            # перепроверяем — вдруг задание приехало ровно в этот момент.
+            rm -rf $PENDING_WATCHER_LOCK
+            set -l again (dictate_list_pending)
+            test (count $again) -eq 0; and break
+            dictate_claim_pending_watcher; or break
+            continue
+        end
+
+        set -l cur (hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null)
+        set -l now (date +%s)
+
+        for f in $files
+            set -l spec (cat $f 2>/dev/null)
+            if test -z "$spec"
+                rm -f $f
+                continue
+            end
+            set -l addr (echo $spec | jq -r '.addr // empty' 2>/dev/null)
+            set -l queued_at (echo $spec | jq -r '.queued_at // 0' 2>/dev/null)
+
+            set -l deliver false
+            if test -n "$cur"; and test "$cur" = "$addr"
+                # Пользователь сам вернулся в окно-получатель — ровно та
+                # ситуация, ради которой всё затевалось: dictate_insert_text
+                # ниже не увидит разницы между "cur" и "target", фокус не
+                # шелохнётся, вставка происходит незаметно.
+                set deliver true
+            else if not dictate_window_exists "$addr"
+                # Окно закрыли, пока текст ждал, — незачем ждать таймаут,
+                # результат всё равно один: в буфер обмена с уведомлением.
+                set deliver true
+            else if test (math "$now - $queued_at") -ge $PENDING_TIMEOUT_SECONDS
+                # Не дождались — доставляем принудительно (прыжок туда-обратно,
+                # как раньше), чтобы текст не потерялся насовсем.
+                dictate_log "pending $f: timeout ($PENDING_TIMEOUT_SECONDS s) — forcing delivery"
+                set deliver true
+            end
+
+            if test "$deliver" = true
+                set -l text (echo $spec | jq -r '.text // empty' 2>/dev/null)
+                dictate_insert_text "$text" "$addr"
+                if test $status -eq 2
+                    # Вставку отложили — файл НЕ удаляем, попробуем на
+                    # следующем круге (через 0.5с), когда клавиши отпустят.
+                    dictate_log "pending $f: insert postponed — will retry"
+                    continue
+                end
+                rm -f $f
+                dictate_sync_state
+            end
+        end
+
+        sleep 0.5
+    end
+
+    dictate_sync_state
+    dictate_reassert_state
+end
+
+
+# ──────────────── распознавание, устойчивое к сбросу видеокарты ────────────
+
+set -g DICTATE_CHUNK_TEXT ""
+set -g DICTATE_JOB_TEXT ""
+
+function dictate_whisper_once --argument-names wav out
+    # Один прогон whisper. Результат кладём в глобальную $DICTATE_CHUNK_TEXT,
+    # а не печатаем на stdout: в fish захват вывода команды затирает её код
+    # возврата, а нам нужно отличать «whisper упал» от «whisper распознал
+    # тишину», и по тексту эти два случая неразличимы.
+    set -g DICTATE_CHUNK_TEXT ""
+    rm -f $out.txt
+    $WHISPER_BIN -m $MODEL -f $wav -l ru -nt -otxt -of $out \
+        --prompt (dictate_prompt) \
+        --vad --vad-model $VAD_MODEL >/dev/null 2>&1
+    set -l rc $status
+    if test $rc -ne 0
+        # Сброс видеокарты убивает whisper сигналом, то есть кодом 128+N
+        # (SIGABRT даёт 134). Тишина — это код 0 и пустой файл, сюда она
+        # не попадает.
+        dictate_log "  whisper exit=$rc on "(basename $wav)
+        return 1
+    end
+    if test -f $out.txt
+        set -g DICTATE_CHUNK_TEXT (cat $out.txt 2>/dev/null | string trim | string collect)
+        rm -f $out.txt
+    end
+    return 0
+end
+
+function dictate_whisper_with_retry --argument-names wav out label
+    for attempt in (seq $WHISPER_ATTEMPTS)
+        if dictate_whisper_once $wav $out
+            test $attempt -gt 1; and dictate_log "  $label: succeeded on attempt $attempt"
+            return 0
+        end
+        dictate_log "  $label: whisper failed (attempt $attempt/$WHISPER_ATTEMPTS)"
+        test $attempt -lt $WHISPER_ATTEMPTS; and sleep $WHISPER_RETRY_DELAY
+    end
+    return 1
+end
+
+function dictate_stt_config
+    # Печатает "<модель>\t<ключ OpenRouter>", если распознавать в облаке, и
+    # ничего — если локально. DICTATE_STT в окружении перебивает кейринг
+    # (для отладки: DICTATE_STT=local).
+    set -l secret (dictate_secrets | string collect)
+    set -l stt "$DICTATE_STT"
+    test -n "$stt"; or set stt (echo "$secret" | jq -r '.apiKeys.dictationStt // empty' 2>/dev/null)
+    test -n "$stt"; or set stt $STT_DEFAULT
+    string match -q 'openrouter:*' -- "$stt"; or return 1
+    set -l model (string replace 'openrouter:' '' -- "$stt")
+    set -l key (echo "$secret" | jq -r '.apiKeys.openrouter // empty' 2>/dev/null)
+    if test -z "$model"; or test -z "$key"
+        dictate_log "cloud STT ($stt) wanted, but no OpenRouter key — using local whisper"
+        return 1
+    end
+    printf '%s\t%s\n' "$model" "$key"
+end
+
+function dictate_transcribe_cloud --argument-names out seq model key
+    # Облачное распознавание через OpenRouter /audio/transcriptions
+    # (OpenAI-совместимый multipart). Все куски уходят ПАРАЛЛЕЛЬНО: на
+    # длинной записи это главный выигрыш — четыре минуты речи распознаются
+    # за время одного куска, а не всех по очереди, как на видеокарте.
+    # Кусок, на котором облако не ответило (сеть, таймаут, кончились
+    # кредиты), дораспознаётся локальным whisper — текст не теряется.
+    # Код возврата и $DICTATE_JOB_TEXT — как у dictate_transcribe.
+    set -l chunks $argv[5..-1]
+    set -l n (count $chunks)
+    set -l prompt (dictate_prompt)
+    set -l tmp $CHUNKS_DIR/$seq-cloud
+    rm -rf $tmp; mkdir -p $tmp
+
+    for i in (seq $n)
+        set -l c $chunks[$i]
+        set -l bytes (stat -c %s $c 2>/dev/null; or echo 0)
+        # Таймаут растёт с длиной куска: короткую фразу незачем ждать дольше
+        # ~8 с, прежде чем отдать её локальному whisper (тот справится за 2-3 с).
+        # Нормальный ответ на 10-секундную фразу — 1.5-2.5 с; первый живой
+        # запуск поймал зависшее соединение (http=000) и прождал 15 с впустую,
+        # отсюда и короткий потолок, и отдельный таймаут на соединение.
+        set -l tmo (math "max(8, round(($bytes - 44) / 32000 * 0.3 + 6))")
+        # FLAC без потерь и примерно вдвое легче WAV — меньше ждать аплоада.
+        set -l up $c
+        if ffmpeg -nostdin -v error -y -i $c -c:a flac $tmp/$i.flac 2>/dev/null
+            set up $tmp/$i.flac
+        end
+        curl -s --connect-timeout 4 --max-time $tmo -o $tmp/$i.json \
+            -w '%{http_code} curl=%{exitcode} %{time_total}s' \
+            https://openrouter.ai/api/v1/audio/transcriptions \
+            -H "Authorization: Bearer $key" \
+            -F "model=$model" -F language=ru \
+            --form-string "prompt=$prompt" \
+            -F "file=@$up" > $tmp/$i.code 2>/dev/null &
+    end
+    wait
+
+    set -g DICTATE_JOB_TEXT ""
+    set -l fallbacks 0
+    for i in (seq $n)
+        # "<http> curl=<код выхода curl> <время>" — для лога; 000 + curl=28 —
+        # таймаут, curl=7/6 — нет соединения.
+        set -l code_line (cat $tmp/$i.code 2>/dev/null)
+        set -l code (string split -f1 ' ' -- "$code_line")
+        set -l text ""
+        set -l ok false
+        if test "$code" = 200
+            # .text может быть и пустой строкой (тишина) — это успех.
+            if jq -e '.text | type == "string"' $tmp/$i.json >/dev/null 2>&1
+                set text (jq -r '.text' $tmp/$i.json | string trim | string collect)
+                set ok true
+            end
+        end
+        if test "$ok" = false
+            set -l err (jq -r '.error.message // empty' $tmp/$i.json 2>/dev/null | string sub -l 200)
+            dictate_log "  cloud chunk $i/$n failed (http=$code_line $err) — local whisper"
+            set fallbacks (math "$fallbacks + 1")
+            if not dictate_whisper_with_retry $chunks[$i] $out-c$i "chunk $i/$n (local fallback)"
+                rm -rf $tmp
+                set -g DICTATE_STT_USED "cloud:$model+local($fallbacks)"
+                return 1
+            end
+            set text "$DICTATE_CHUNK_TEXT"
+        end
+        if test -n "$text"
+            if test -n "$DICTATE_JOB_TEXT"
+                set -g DICTATE_JOB_TEXT "$DICTATE_JOB_TEXT $text"
+            else
+                set -g DICTATE_JOB_TEXT "$text"
+            end
+        end
+        printf '%s' "$DICTATE_JOB_TEXT" > $PARTIAL_DIR/$seq.txt 2>/dev/null
+    end
+    rm -rf $tmp
+
+    if test $fallbacks -eq 0
+        set -g DICTATE_STT_USED "cloud:$model"
+    else if test $fallbacks -eq $n
+        set -g DICTATE_STT_USED "local(cloud failed)"
+    else
+        set -g DICTATE_STT_USED "cloud:$model+local($fallbacks)"
+    end
+    return 0
+end
+
+function dictate_cleanup_job_artifacts --argument-names seq
+    rm -f $PARTIAL_DIR/$seq.txt $PARTIAL_DIR/$seq.idx 2>/dev/null
+    rm -rf $CHUNKS_DIR/$seq 2>/dev/null
+end
+
+function dictate_transcribe --argument-names wav out seq
+    # Распознаёт запись целиком; текст остаётся в $DICTATE_JOB_TEXT.
+    # Код 0 — распознаны все куски; код 1 — часть потеряна, и тогда в
+    # $DICTATE_JOB_TEXT лежит всё, что успели распознать до сбоя.
+    set -g DICTATE_JOB_TEXT ""
+
+    set -l partial_file $PARTIAL_DIR/$seq.txt
+    set -l index_file $PARTIAL_DIR/$seq.idx
+    set -l chunk_dir $CHUNKS_DIR/$seq
+
+    # Режем один раз: если сессия упала и воркер подобрал то же задание
+    # снова, переиспользуем уже нарезанное вместо повторной нарезки.
+    set -l chunks (find $chunk_dir -maxdepth 1 -type f -name 'chunk-*.wav' 2>/dev/null | sort)
+    if test (count $chunks) -eq 0
+        set chunks ($SPLIT_SCRIPT $wav $chunk_dir $CHUNK_SECONDS 2>/dev/null)
+    end
+    # Нарезка не удалась или не понадобилась — работаем с записью целиком.
+    test (count $chunks) -gt 0; or set chunks $wav
+
+    # С какого куска продолжать. Индекс пишется после каждого удачного куска,
+    # поэтому пережившее падение задание не распознаёт заново уже сделанное —
+    # а на семиминутной записи это минуты работы видеокарты.
+    set -l start 1
+    if test -f $index_file
+        set -l saved (cat $index_file 2>/dev/null | string trim)
+        if string match -qr '^[0-9]+$' -- "$saved"; and test "$saved" -ge 1
+            set start $saved
+        end
+    end
+    if test $start -gt 1; and test -f $partial_file
+        set -g DICTATE_JOB_TEXT (cat $partial_file 2>/dev/null | string collect)
+        dictate_log "JOB $seq: resuming at chunk $start/"(count $chunks)", "(string length -- "$DICTATE_JOB_TEXT")" chars already recognized"
+    end
+
+    # Облако — только для задания с нуля: возобновление после сбоя идёт тем
+    # же локальным путём, которым задание и начинало.
+    set -g DICTATE_STT_USED local
+    if test $start -eq 1
+        set -l stt (dictate_stt_config)
+        if test -n "$stt"
+            set -l p (string split \t -- "$stt")
+            dictate_transcribe_cloud $out $seq $p[1] $p[2] $chunks
+            return $status
+        end
+    end
+
+    for i in (seq $start (count $chunks))
+        set -l label "chunk $i/"(count $chunks)
+        if not dictate_whisper_with_retry $chunks[$i] $out-c$i "$label"
+            dictate_log "JOB $seq: $label lost — keeping what was recognized so far"
+            return 1
+        end
+        if test -n "$DICTATE_CHUNK_TEXT"
+            if test -n "$DICTATE_JOB_TEXT"
+                set -g DICTATE_JOB_TEXT "$DICTATE_JOB_TEXT $DICTATE_CHUNK_TEXT"
+            else
+                set -g DICTATE_JOB_TEXT "$DICTATE_CHUNK_TEXT"
+            end
+        end
+        # На диск после каждого куска — в этом весь смысл затеи: если прямо
+        # сейчас видеокарта унесёт с собой сессию, текст уже сохранён.
+        printf '%s' "$DICTATE_JOB_TEXT" > $partial_file 2>/dev/null
+        echo (math "$i + 1") > $index_file 2>/dev/null
+    end
+
+    return 0
+end
+
+function dictate_save_failed --argument-names seq wav spec text
+    # Задание, которое whisper не осилил даже с повторами. Не выбрасываем
+    # ничего: запись остаётся на диске, распознанная часть — в буфере обмена
+    # и в файле рядом с ней. Повторить: whisper-dictate --retry-failed
+    mkdir -p $FAILED_DIR 2>/dev/null
+    printf '%s' "$spec" > $FAILED_DIR/$seq.job 2>/dev/null
+    if test -n "$text"
+        printf '%s' "$text" > $FAILED_DIR/$seq.txt 2>/dev/null
+        printf '%s' "$text" | wl-copy 2>/dev/null
+    end
+    # Куски и промежуточный текст оставляем: повтор продолжит с места обрыва.
+end
+
+function dictate_retry_failed
+    set -l jobs (find $FAILED_DIR -maxdepth 1 -type f -name '*.job' 2>/dev/null | sort)
+    if test (count $jobs) -eq 0
+        notify-send "Диктовка" "Незаконченных записей нет"
+        return
+    end
+    for j in $jobs
+        set -l seq (basename $j .job)
+        set -l wav (cat $j 2>/dev/null | jq -r '.wav // empty' 2>/dev/null)
+        if not test -s "$wav"
+            dictate_log "retry-failed: $seq — audio gone, dropping"
+            rm -f $j $FAILED_DIR/$seq.txt
+            dictate_cleanup_job_artifacts $seq
+            continue
+        end
+        mv $j $QUEUE_DIR/$seq.job 2>/dev/null
+        rm -f $FAILED_DIR/$seq.txt
+        dictate_log "retry-failed: $seq re-queued"
+    end
+    notify-send "Диктовка" "Записи возвращены в очередь: "(count $jobs)
+    dictate_sync_state
+    fish $SELF --run-worker >/dev/null 2>&1 &
+end
+
+
+function dictate_process_job --argument-names job
+    set -l spec (cat $job 2>/dev/null)
+    test -n "$spec"; or return
+
+    set -l seq (basename $job .job)
+    set -l wav (echo $spec | jq -r '.wav // empty')
+    set -l addr (echo $spec | jq -r '.target_addr // empty')
+    set -l title (echo $spec | jq -r '.target_title // empty')
+    set -l class (echo $spec | jq -r '.target_class // empty')
+    set -l lang (echo $spec | jq -r '.lang // "ru"')
+    set -l out $DICT_DIR/out-$seq
+
+    dictate_log "JOB $seq start: lang=$lang target=$addr \"$title\" wav=$wav"
+
+    if not test -s "$wav"
+        dictate_log "JOB $seq: no audio file"
+        rm -f $wav
+        notify-send "Диктовка" "Запись не удалась (нет аудио)"
+        return
+    end
+
+    # Длительность записи и время каждого этапа пишутся в лог (строка TIMING
+    # ниже). Без этого «диктовка тормозит» невозможно разобрать: непонятно,
+    # ушло время в whisper, в перевод или во вставку, — а лечатся они
+    # по-разному. `date +%s.%N` вместо целых секунд, потому что тёплый перевод
+    # укладывается в доли секунды и на целых числах выглядел бы нулём.
+    set -l t_start (date +%s.%N)
+    # Длительность считается из размера файла, а не через soxi/ffprobe: формат
+    # задан здесь же в dictate_start (16 кГц, моно, s16 = 32000 байт/с), так
+    # что арифметика точна и не тянет лишней зависимости (soxi на этой машине
+    # и не установлен). 44 байта — заголовок WAV.
+    set -l wav_bytes (stat -c %s $wav 2>/dev/null; or echo 0)
+    set -l audio_secs (math -s2 "($wav_bytes - 44) / 32000")
+    # Сравнение через round(x*100): fish math не умеет операторы сравнения,
+    # а test работает только с целыми — поэтому сравниваем сотые доли как int.
+    test (math "round($audio_secs * 100)") -lt 0; and set audio_secs 0
+
+    # VAD (Silero) отсекает тишину/шум ДО декодера — без него whisper на
+    # пустом или зашумлённом хвосте записи дописывает выученные по YouTube
+    # субтитровые фразы ("Продолжение следует" и т.п.), см. $HALLUCINATION_*
+    # выше. Список там остаётся как второй рубеж защиты, а не единственный.
+    dictate_transcribe $wav $out $seq
+    set -l transcribed $status
+    set -l t_whisper (date +%s.%N)
+    set -l text "$DICTATE_JOB_TEXT"
+
+    if test $transcribed -ne 0
+        # whisper не дошёл до конца — практически всегда это сброс видеокарты
+        # (см. комментарий у $CHUNK_SECONDS в шапке файла). Запись НЕ удаляем:
+        # раньше строкой ниже стоял безусловный `rm -f $wav`, и надиктованное
+        # пропадало насовсем именно из-за него.
+        set -l saved (dictate_strip_hallucinations "$text" | string collect)
+        dictate_save_failed $seq "$wav" "$spec" "$saved"
+        if test -n "$saved"
+            notify-send "Диктовка: распознавание оборвалось" \
+                "Распознанная часть — в буфере обмена. Запись цела, повтор: whisper-dictate --retry-failed"
+        else
+            notify-send "Диктовка: распознавание оборвалось" \
+                "Запись сохранена и не потеряна. Повтор: whisper-dictate --retry-failed"
+        end
+        dictate_log "JOB $seq: FAILED after retries — wav kept, "(string length -- "$saved")" chars salvaged"
+        return
+    end
+
+    # Дошли до конца — только теперь можно убирать за собой.
+    rm -f $out.txt $wav
+    dictate_cleanup_job_artifacts $seq
+
+    # Чистим галлюцинации ДО проверки на пустоту: на тишине whisper выдаёт не
+    # пустую строку, а "Продолжение следует..." — без чистки это уехало бы в
+    # Gemini и вставилось бы в окно как "To be continued...".
+    set -l cleaned (dictate_strip_hallucinations "$text")
+    if test "$cleaned" != "$text"
+        dictate_log "JOB $seq: hallucination stripped: \"$text\" -> \"$cleaned\""
+        set text "$cleaned"
+    end
+
+    if test -z "$text"
+        dictate_log "JOB $seq: nothing recognized"
+        notify-send "Диктовка" "Ничего не распознано"
+        return
+    end
+
+    # Язык могли поменять из попапа, пока шло распознавание (--set-lang
+    # переписывает job-файл) — берём самый свежий.
+    set -l fresh_lang (jq -r '.lang // empty' $job 2>/dev/null)
+    if test -n "$fresh_lang"; and test "$fresh_lang" != "$lang"
+        dictate_log "JOB $seq: language changed during recognition: $lang -> $fresh_lang"
+        set lang $fresh_lang
+    end
+
+    if test "$lang" != ru
+        set -l translated (dictate_translate "$text" "$lang")
+        if test -n "$translated"
+            set text "$translated"
+        else
+            set -l reason "причина неизвестна"
+            if test -f /tmp/dictate_last_error
+                set reason (cat /tmp/dictate_last_error | string collect)
+            end
+            notify-send "Диктовка: перевод не удался" "Вставлен русский текст.\n$reason"
+        end
+    end
+    set -l t_translate (date +%s.%N)
+
+    # Одна строка на задание, читаемая глазами и грепаемая скриптом. xN — это
+    # во сколько раз распознавание быстрее реального времени: именно оно
+    # показывает, стоит ли трогать whisper, а не абсолютные секунды, которые
+    # зависят от длины записи.
+    set -l d_whisper (math -s2 "$t_whisper - $t_start")
+    set -l d_translate (math -s2 "$t_translate - $t_whisper")
+    set -l d_total (math -s2 "$t_translate - $t_start")
+    set -l rt ""
+    if test (math "round($audio_secs * 100)") -gt 0
+        set rt " ("(math -s1 "$audio_secs / $d_whisper")"x realtime)"
+    end
+    dictate_log "JOB $seq TIMING: audio "(math -s1 $audio_secs)"s | whisper $d_whisper""s$rt | translate $d_translate""s | total $d_total""s | stt $DICTATE_STT_USED | lang $lang"
+
+    # Пункт 4 в шапке файла: если окно-получатель прямо сейчас на экране —
+    # вставляем как обычно, никакой разницы для пользователя. Если нет —
+    # не дёргаем фокус ради вставки, а откладываем текст до момента, когда
+    # пользователь сам туда вернётся (или до таймаута — см. dictate_run_pending_watcher).
+    set -l cur (hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null)
+    set -l defer true
+    set -l defer_reason "target not focused (cur=$cur)"
+    if test -z "$addr"; or test "$cur" = "$addr"
+        dictate_insert_text "$text" "$addr"
+        if test $status -eq 2
+            # Зажаты модификаторы (или фокус уехал, пока их ждали): вставлять
+            # сейчас нельзя, но и терять текст незачем — отдаём его watcher-у
+            # тем же путём, что и для окна на другом воркспейсе.
+            set defer_reason "insert postponed (modifiers/focus)"
+        else
+            set defer false
+            dictate_log "JOB $seq done (inserted immediately)"
+        end
+    end
+    if test "$defer" = true
+        jq -n -c --arg addr "$addr" --arg title "$title" --arg cls "$class" \
+            --arg lang "$lang" --arg text "$text" --argjson qa (date +%s) \
+            '{addr: $addr, title: $title, cls: $cls, lang: $lang, text: $text, queued_at: $qa}' \
+            > $PENDING_DIR/$seq.json.tmp 2>/dev/null
+        mv $PENDING_DIR/$seq.json.tmp $PENDING_DIR/$seq.json 2>/dev/null
+        dictate_log "JOB $seq: $defer_reason — deferred to \"$title\", waiting for natural refocus"
+        fish $SELF --run-pending-watcher >/dev/null 2>&1 &
+    end
+end
+
+
+# ─────────────────────────────── отмена ────────────────────────────────────
+
+function dictate_cancel_recording
+    # Текущая запись выбрасывается целиком: ни задания, ни WAV, ни вставки.
+    test -d $LOCKDIR; or return 1
+    set -l seq (cat $LOCKDIR/seq 2>/dev/null)
+    set -l wav (cat $LOCKDIR/wav 2>/dev/null)
+    dictate_kill_lock
+    sleep 0.2
+    test -n "$wav"; and rm -f $wav
+    dictate_log "CANCEL $seq: recording discarded"
+    return 0
+end
+
+function dictate_cancel_queue
+    # Порядок важен: сначала убираем файлы заданий, только потом убиваем
+    # воркера. Наоборот — и он успеет подхватить следующее задание в тот
+    # момент, пока мы до него добираемся. То же самое для готовых-но-не-
+    # вставленных текстов ($PENDING_DIR, пункт 4 в шапке файла) — с точки
+    # зрения пользователя это тоже «незавершённая диктовка», отменять
+    # очередь означает отменять и их.
+    set -l jobs (dictate_list_jobs)
+    set -l n (count $jobs)
+    set -l ready_files (dictate_list_pending)
+    set -l rn (count $ready_files)
+    test $n -eq 0; and test $rn -eq 0; and return 1
+
+    for job in $jobs
+        set -l wav (jq -r '.wav // empty' < $job 2>/dev/null)
+        test -n "$wav"; and rm -f $wav
+        # Нарезанные куски и накопленный текст — часть того же задания,
+        # отмена очереди должна уносить и их, иначе они останутся мусором
+        # и собьют возобновление у следующего задания с тем же номером.
+        dictate_cleanup_job_artifacts (basename $job .job)
+        rm -f $job
+    end
+    for f in $ready_files
+        rm -f $f
+    end
+
+    set -l wpid (cat $WORKER_LOCK/pid 2>/dev/null)
+    if test -n "$wpid"; and kill -0 $wpid 2>/dev/null
+        # whisper — прямой потомок воркера, и убить надо именно его: сам по
+        # себе он переживёт смерть родителя и допишет out-*.txt в никуда.
+        pkill -P $wpid 2>/dev/null
+        dictate_kill_pid $wpid TERM
+    end
+    rm -rf $WORKER_LOCK
+    rm -f $DICT_DIR/out-*.txt
+
+    # Пендинг-воркеру убивать нечего — он не делает ничего тяжёлого, просто
+    # спит между проверками (см. dictate_run_pending_watcher). Опустошённый
+    # $PENDING_DIR он сам заметит на следующем тике (≤0.5с) и выйдет штатно
+    # тем же путём, что и при полной обработке очереди.
+
+    dictate_log "CANCEL: queue cleared ($n job(s), $rn pending insert(s))"
+    return 0
+end
+
+
+# ──────────────────────────── старт / стоп ─────────────────────────────────
+
+function dictate_start
+    set -l seq (dictate_next_seq)
+    set -l wav $DICT_DIR/rec-$seq.wav
+
+    # Фиксируем окно-получатель СЕЙЧАС (пункт 1 в шапке файла).
+    set -l addr ""
+    set -l title ""
+    set -l class ""
+    set -l win (hyprctl activewindow -j 2>/dev/null | jq -r '[(.address // ""), (.title // ""), (.class // "")] | @tsv' 2>/dev/null)
+    if test -n "$win"
+        set -l p (string split \t -- "$win")
+        set addr $p[1]
+        set title $p[2]
+        set class $p[3]
+    end
+
+    set -l keymap (dictate_current_keymap)
+
+    echo $seq > $LOCKDIR/seq
+    echo $wav > $LOCKDIR/wav
+    echo $addr > $LOCKDIR/target_addr
+    echo $title > $LOCKDIR/target_title
+    echo $class > $LOCKDIR/target_class
+    echo $keymap > $LOCKDIR/keymap
+    # Закреплённый за окном/приложением язык важнее раскладки.
+    set -l pin (dictate_pin_lookup "$addr" "$class")
+    if test -n "$pin"
+        set -l pp (string split \t -- "$pin")
+        echo $pp[1] > $LOCKDIR/lang
+        echo $pp[2] > $LOCKDIR/lang_pinned
+    else
+        dictate_lang_code "$keymap" > $LOCKDIR/lang
+    end
+    date +%s > $LOCKDIR/started_at
+
+    pw-record --rate 16000 --channels 1 --format s16 $wav &
+    echo $last_pid > $LOCKDIR/pw.pid
+
+    dictate_log "START $seq: target=$addr [$class] \"$title\" layout=$keymap"
+    dictate_sync_state
+
+    # Следим за раскладкой окна-получателя до конца записи. Watcher умирает
+    # сам, когда пропадает $LOCKDIR, — убивать его отдельно не нужно.
+    fish $SELF --watch $LOCKDIR "$addr" >/dev/null 2>&1 &
+end
+
+function dictate_stop
+    set -l seq (cat $LOCKDIR/seq 2>/dev/null)
+    set -l wav (cat $LOCKDIR/wav 2>/dev/null)
+    set -l addr (cat $LOCKDIR/target_addr 2>/dev/null)
+    set -l title (cat $LOCKDIR/target_title 2>/dev/null)
+    set -l class (cat $LOCKDIR/target_class 2>/dev/null)
+    set -l keymap (cat $LOCKDIR/keymap 2>/dev/null)
+    set -l lang (cat $LOCKDIR/lang 2>/dev/null)
+
+    test -n "$seq"; or set seq (dictate_next_seq)
+    test -n "$wav"; or set wav $DICT_DIR/rec-$seq.wav
+    test -n "$lang"; or set lang ru
+
+    # dictate_kill_lock ждёт выхода pw-record (см. dictate_kill_pid), так что
+    # заголовок WAV к этому моменту уже дописан — фиксированная пауза не нужна.
+    dictate_kill_lock
+
+    # Публикация задания атомарна (mv), чтобы воркер не подхватил
+    # недописанный файл.
+    jq -n -c --arg wav "$wav" --arg addr "$addr" --arg title "$title" \
+        --arg class "$class" --arg keymap "$keymap" --arg lang "$lang" \
+        '{wav: $wav, target_addr: $addr, target_title: $title, target_class: $class, keymap: $keymap, lang: $lang}' \
+        > $QUEUE_DIR/$seq.job.tmp 2>/dev/null
+    mv $QUEUE_DIR/$seq.job.tmp $QUEUE_DIR/$seq.job 2>/dev/null
+
+    dictate_log "STOP $seq: queued (lang=$lang target=$addr \"$title\")"
+    dictate_sync_state
+
+    dictate_run_worker
+end
+
+
+# ──────────────────────────────── точка входа ──────────────────────────────
+
+function dictate_cleanup_legacy
+    # Одноразовая уборка за прошлой версией скрипта: раньше лока записи жила
+    # в ~/.cache/dictate.lock, а звук — в /tmp/dictate.wav.
+    if test -d $LEGACY_LOCKDIR
+        if test -f $LEGACY_LOCKDIR/pw.pid
+            dictate_kill_pid (cat $LEGACY_LOCKDIR/pw.pid) INT
+        end
+        rm -rf $LEGACY_LOCKDIR
+        rm -f /tmp/dictate.wav /tmp/dictate_out.txt
+        dictate_log "cleaned up legacy lock dir"
+    end
+end
+
+mkdir -p $DICT_DIR $QUEUE_DIR $PENDING_DIR $PARTIAL_DIR $FAILED_DIR $CHUNKS_DIR (dirname $STATE_FILE) (dirname $LOG_FILE) 2>/dev/null
+
+switch "$argv[1]"
+    case --test
+        # Самопроверка установки: зависимости, бинарник, модели, ключи,
+        # права на secrets.env, дубли в кейринге. --full: прогон whisper на
+        # тишине и пинг облачных провайдеров. Код возврата 1 — есть FAIL.
+        source $WD_LIBDIR/setup-core.fish
+        wd_selftest $argv[2..-1]
+        exit $status
+    case --version
+        echo "whisper-dictate "(wd_version)
+        exit 0
+    case --run-worker
+        dictate_run_worker
+        exit 0
+    case --retry-failed
+        dictate_retry_failed
+        exit 0
+    case --watch
+        dictate_layout_watcher $argv[2] "$argv[3]"
+        exit 0
+    case --sync
+        test -n "$argv[2]"; and sleep $argv[2]
+        dictate_sync_state
+        exit 0
+    case --run-pending-watcher
+        dictate_run_pending_watcher
+        exit 0
+    case --set-lang
+        dictate_set_lang "$argv[2]" "$argv[3]" "$argv[4]" "$argv[5]"
+        exit $status
+    case --effective-lang
+        dictate_effective_lang "$argv[2]" "$argv[3]" "$argv[4]"
+        exit 0
+    case --cancel
+        set -l what $argv[2]
+        test -n "$what"; or set what all
+        set -l killed_rec false
+        set -l killed_queue false
+        if contains -- $what recording all
+            dictate_cancel_recording; and set killed_rec true
+        end
+        if contains -- $what queue all
+            dictate_cancel_queue; and set killed_queue true
+        end
+        dictate_sync_state
+        dictate_reassert_state
+        if test "$killed_rec" = true; and test "$killed_queue" = true
+            notify-send "Диктовка" "Отменено: запись и очередь"
+        else if test "$killed_rec" = true
+            notify-send "Диктовка" "Запись отменена"
+        else if test "$killed_queue" = true
+            notify-send "Диктовка" "Очередь очищена"
+        end
+        exit 0
+end
+
+dictate_cleanup_legacy
+
+# Самолечение: если в $PENDING_DIR остались файлы, а следящего за ними
+# процесса нет (спал ноутбук, упал Hyprland/сессия, что угодно) — готовый
+# текст рискует зависнуть там навсегда, никем не подхваченный. Проверка
+# дешёвая (posix ls + kill -0), гоняется на каждом обычном нажатии SUPER+U.
+set -l orphan_pending (dictate_list_pending)
+if test (count $orphan_pending) -gt 0
+    set -l wpid (cat $PENDING_WATCHER_LOCK/pid 2>/dev/null)
+    if test -z "$wpid"; or not kill -0 $wpid 2>/dev/null
+        dictate_log "orphaned pending inserts found, no live watcher — relaunching"
+        fish $SELF --run-pending-watcher >/dev/null 2>&1 &
+    end
+end
+
+# Записи, на которых оборвалось распознавание (сброс видеокарты), лежат
+# целыми в $FAILED_DIR и ждут повтора. Напоминаем о них один раз за нажатие,
+# чтобы человек знал: ничего не пропало, и есть чем это забрать.
+set -l unfinished (find $FAILED_DIR -maxdepth 1 -type f -name '*.job' 2>/dev/null)
+if test (count $unfinished) -gt 0
+    dictate_log "unfinished recordings waiting in $FAILED_DIR: "(count $unfinished)
+    notify-send "Диктовка" \
+        "Незаконченных записей: "(count $unfinished)". Дораспознать: whisper-dictate --retry-failed"
+end
+
+if mkdir $LOCKDIR 2>/dev/null
+    dictate_start
+else
+    set -l live false
+    if test -f $LOCKDIR/pw.pid; and kill -0 (cat $LOCKDIR/pw.pid) 2>/dev/null
+        set live true
+    end
+
+    if test "$live" = true
+        dictate_stop
+    else
+        # Лока осталась от убитого процесса — чистим и начинаем заново.
+        dictate_kill_lock
+        mkdir -p $LOCKDIR
+        dictate_start
+    end
+end

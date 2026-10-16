@@ -1,0 +1,110 @@
+#!/usr/bin/env fish
+# Мастер настройки whisper-dictate: GUI (zenity/kdialog), TUI (fzf) или CLI.
+#
+#   whisper-dictate-setup                  интерактивно; режим выбирается сам
+#   whisper-dictate-setup --gui|--tui|--cli [...]   принудительный режим
+#   whisper-dictate-setup status | test [--full]    самопроверка
+#   whisper-dictate-setup key NAME [--env]          записать ключ (значение со stdin)
+#   whisper-dictate-setup keys ...                  бывший set-api-key.fish
+#   whisper-dictate-setup conf KEY [VALUE]          прочитать/записать dictate.conf
+#   whisper-dictate-setup model download NAME       tiny|base|small|medium|large-v3|large-v3-turbo|vad
+#   whisper-dictate-setup bind [apply|remove|status] [--key "SUPER + U"] [--file F]
+#                                  [--force] [--replace-legacy] [--dry-run]
+#   whisper-dictate-setup doctor [--fix] [--yes]    дубли в кейринге
+#   whisper-dictate-setup migrate                   подцепить старую установку
+#
+# Секреты читаются только со stdin / скрытым вводом, в argv не передаются.
+
+set -g WD_LIBDIR ""
+for d in "$WHISPER_DICTATE_LIBDIR" (dirname (realpath (status filename)))/../lib /usr/lib/whisper-dictate
+    if test -n "$d"; and test -f $d/setup-core.fish
+        set -g WD_LIBDIR (realpath $d)
+        break
+    end
+end
+if test -z "$WD_LIBDIR"
+    echo "whisper-dictate-setup: не найден setup-core.fish (ожидается в /usr/lib/whisper-dictate)" >&2
+    exit 1
+end
+source $WD_LIBDIR/setup-core.fish
+
+set -l mode auto
+set -l args $argv
+if contains -- $args[1] --gui --tui --cli
+    set mode (string sub -s 3 -- $args[1])
+    set -e args[1]
+end
+
+function usage
+    sed -n '2,/^$/p' (status filename) | string replace -r '^# ?' ''
+end
+
+function pick_mode
+    set -l has_gui 1
+    begin command -q zenity; or command -q kdialog; end; and begin test -n "$WAYLAND_DISPLAY"; or test -n "$DISPLAY"; end; and set has_gui 0
+    if test -t 0
+        command -q fzf; and echo tui; or echo cli
+    else if test $has_gui -eq 0
+        echo gui
+    else
+        echo cli
+    end
+end
+
+switch "$args[1]"
+    case -h --help help
+        usage
+    case status test
+        wd_selftest $args[2..-1]
+        exit $status
+    case key
+        set -l name $args[2]
+        test -n "$name"; or begin; echo "Использование: key NAME [--env] < значение" >&2; exit 1; end
+        set -l where ""
+        contains -- --env $args; and set where env
+        wd_key_store $name $where
+        exit $status
+    case keys
+        wd_keys_cli $args[2..-1]
+        exit $status
+    case conf
+        if test (count $args) -eq 2
+            wd_conf $args[2] ""
+        else if test (count $args) -ge 3
+            wd_conf_set $args[2] $args[3]
+            exit $status
+        else
+            cat $WD_USER_CONF 2>/dev/null
+        end
+    case model
+        switch "$args[2]"
+            case download; wd_model_download $args[3..-1]; exit $status
+            case link-legacy; wd_model_link_legacy
+            case dir; wd_model_dir
+            case '*'; echo "Использование: model download NAME | link-legacy | dir" >&2; exit 1
+        end
+    case bind
+        set -l sub apply
+        if contains -- $args[2] apply remove status
+            set sub $args[2]
+            set -e args[2]
+        end
+        wd_bind $sub $args[2..-1]
+        exit $status
+    case doctor
+        wd_doctor $args[2..-1]
+        exit $status
+    case migrate
+        wd_model_link_legacy
+        echo "Модели подключены. Старые ~/.local/bin/dictate.fish и set-api-key.fish не тронуты —"
+        echo "переключите бинд командой: whisper-dictate-setup bind --replace-legacy"
+    case ''
+        test $mode = auto; and set mode (pick_mode)
+        source $WD_LIBDIR/ui-$mode.fish
+        source $WD_LIBDIR/setup-flow.fish
+        wd_flow_main
+    case '*'
+        echo "Неизвестная команда: $args[1]" >&2
+        usage >&2
+        exit 1
+end

@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "$*" >> "${STUB_NOTIFY_LOG:-/dev/null}"

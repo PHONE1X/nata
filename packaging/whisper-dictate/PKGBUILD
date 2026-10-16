@@ -1,0 +1,40 @@
+# Maintainer: wowprofi4 <wowprofi4@gmail.com>
+# Локальная сборка из дерева репозитория: cd packaging/whisper-dictate && makepkg -si
+# Для AUR заменить _src на tarball релиза (source=(...) + sha256sums).
+pkgname=whisper-dictate
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Voice dictation for Wayland/Hyprland: whisper.cpp, optional cloud STT and translation, setup GUI/TUI'
+arch=(any)
+url='https://github.com/wowprofi4/whisper-dictate'
+license=(MIT)
+depends=(fish jq python libsecret util-linux curl ffmpeg pipewire wl-clipboard libnotify ydotool)
+makedepends=()
+optdepends=('whisper.cpp-vulkan: GPU-accelerated local speech recognition (or any whisper-cli in PATH)'
+            'zenity: setup GUI'
+            'kdialog: setup GUI (KDE)'
+            'fzf: setup TUI'
+            'quickshell-ii-dictate: bar indicator integration for Quickshell ii')
+backup=(etc/whisper-dictate/dictate.conf)
+_src="$startdir/../.."
+
+package() {
+  cd "$_src"
+  install -Dm755 bin/whisper-dictate       "$pkgdir/usr/bin/whisper-dictate"
+  install -Dm755 bin/whisper-dictate-setup "$pkgdir/usr/bin/whisper-dictate-setup"
+
+  local f
+  for f in lib/*.fish lib/*.py lib/VERSION; do
+    install -Dm644 "$f" "$pkgdir/usr/lib/whisper-dictate/${f##*/}"
+  done
+  chmod 755 "$pkgdir"/usr/lib/whisper-dictate/*.py
+
+  install -Dm644 etc/whisper-dictate/dictate.conf "$pkgdir/etc/whisper-dictate/dictate.conf"
+  install -Dm644 share/whisper-dictate/secrets.env.example \
+    "$pkgdir/usr/share/whisper-dictate/secrets.env.example"
+  for f in share/applications/*.desktop; do
+    install -Dm644 "$f" "$pkgdir/usr/share/applications/${f##*/}"
+  done
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

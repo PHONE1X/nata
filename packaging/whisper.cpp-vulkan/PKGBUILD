@@ -1,0 +1,32 @@
+# Maintainer: wowprofi4 <wowprofi4@gmail.com>
+# whisper.cpp с Vulkan-бэкендом (AMD/Intel/NVIDIA GPU без CUDA). Ставит whisper-cli и др. в /usr/bin.
+pkgname=whisper.cpp-vulkan
+pkgver=1.9.2
+pkgrel=1
+pkgdesc='Port of OpenAI Whisper in C/C++ (Vulkan GPU backend)'
+arch=(x86_64 aarch64)
+url='https://github.com/ggml-org/whisper.cpp'
+license=(MIT)
+depends=(vulkan-icd-loader gcc-libs glibc)
+makedepends=(cmake git vulkan-headers shaderc)
+provides=(whisper.cpp)
+conflicts=(whisper.cpp whisper.cpp-cuda whisper.cpp-clblas whisper.cpp-openblas)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP') # заменить через updpkgsums перед публикацией
+
+build() {
+  cmake -S "whisper.cpp-$pkgver" -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DGGML_VULKAN=ON \
+    -DGGML_NATIVE=OFF \
+    -DWHISPER_BUILD_TESTS=OFF \
+    -DWHISPER_BUILD_EXAMPLES=ON \
+    -DBUILD_SHARED_LIBS=ON
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 "whisper.cpp-$pkgver/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

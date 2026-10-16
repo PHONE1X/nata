@@ -1,0 +1,8 @@
+*.pkg.tar.*
+*.src.tar.*
+packaging/*/src/
+packaging/*/pkg/
+packaging/*/*.tar.gz
+secrets.env
+*.bak_*
+__pycache__/
