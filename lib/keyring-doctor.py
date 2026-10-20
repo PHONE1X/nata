@@ -73,7 +73,9 @@ def parse_items(text):
 
 
 def fetch(app):
-    r = run(["secret-tool", "search", "--all", "application", app])
+    # secret-tool печатает строки attribute.* в stderr: объединяем потоки, чтобы они шли по порядку.
+    r = subprocess.run(["secret-tool", "search", "--all", "application", app],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if r.returncode not in (0, 1):
         sys.exit("secret-tool search не удался (кейринг заблокирован?)")
     items = parse_items(r.stdout)
@@ -140,7 +142,8 @@ def canonical(app, items):
     """Атрибуты и метка, с которыми записывать, чтобы заменить существующую запись."""
     if items:
         newest = items[-1]
-        return newest.get("label") or DEFAULT_LABEL, dict(newest["attrs"])
+        attrs = dict(newest["attrs"]) or {"application": app}
+        return newest.get("label") or DEFAULT_LABEL, attrs
     return DEFAULT_LABEL, {"application": app, "explanation": DEFAULT_EXPLANATION}
 
 
