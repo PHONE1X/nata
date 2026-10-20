@@ -21,7 +21,23 @@ KEY_SLOTS = [
     ("deepl", "DeepL", "перевод"),
     ("gemini", "Google Gemini", "перевод"),
 ]
-TRANSLATE_CHOICES = [("gemini", "Google Gemini"), ("deepl", "DeepL"), ("local", "Локальный перевод (Ollama / Marian)")]
+TRANSLATE_CHOICES = [("deepl", "DeepL"), ("gemini", "Google Gemini"), ("local", "Локально (OPUS-MT или Ollama)")]
+DEFAULT_MODEL_DIR = "~/.local/share/whisper-dictate/models"
+DEFAULT_MT_DIR = "~/.local/share/whisper-dictate/mt-models"
+# Совпадают с WHISPER_MODELS в lib/engines.py.
+WHISPER_CHOICES = [
+    ("ggml-large-v3-turbo.bin", "large-v3-turbo — лучший выбор: точно и быстро"),
+    ("ggml-large-v3-turbo-q5_0.bin", "large-v3-turbo q5 — почти так же точно, втрое меньше"),
+    ("ggml-large-v3.bin", "large-v3 — самая точная, медленнее"),
+    ("ggml-medium.bin", "medium"),
+    ("ggml-small.bin", "small — для слабых машин"),
+    ("ggml-base.bin", "base — быстро, но много ошибок"),
+]
+VAD_NAME = "ggml-silero-v5.1.2.bin"
+ACCEL_TITLES = {"vulkan": "Vulkan", "hip": "ROCm (AMD)", "cuda": "CUDA (NVIDIA)", "cpu": "процессор"}
+ACCEL_CHOICES = [("auto", "Авто"), ("vulkan", "Vulkan"), ("hip", "ROCm (AMD)"), ("cuda", "CUDA (NVIDIA)"),
+                 ("cpu", "Процессор")]
+OLLAMA_CHOICES = [("vulkan", "Vulkan"), ("rocm", "ROCm (AMD)"), ("cuda", "CUDA (NVIDIA)"), ("cpu", "Процессор")]
 QS_TARGETS = [
     ("standalone", "Отдельный виджет", "Самостоятельный индикатор. Запуск: qs -c whisper-dictate"),
     ("ii", "Logical Impulse (ii)", "Кнопка в баре и пункт «Диктовка» в настройках. После установки перезапустите Quickshell."),
@@ -63,15 +79,6 @@ def effective(conf, conf_key, slot):
     return conf.get(conf_key) or stored(slot)
 
 
-# Как в bin/whisper-dictate: имя без «/» ищется в MODEL_DIR.
-def model_path(conf, key, default_name):
-    name = conf.get(key) or default_name
-    if "/" in name:
-        return name
-    model_dir = conf.get("MODEL_DIR") or "~/.local/share/whisper-dictate/models"
-    return os.path.join(os.path.expanduser(model_dir), name)
-
-
 def box(spacing=8):
     return Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing,
                    margin_top=16, margin_bottom=16, margin_start=16, margin_end=16)
@@ -111,8 +118,12 @@ class Settings(Gtk.ApplicationWindow):
         sidebar = Gtk.StackSidebar(stack=self.stack)
         self.status = Gtk.Label(xalign=0, wrap=True, margin_start=16, margin_end=16, margin_bottom=8)
 
+        self.progress = Gtk.ProgressBar(show_text=True, visible=False, margin_start=16, margin_end=16)
+        self.busy = False
+
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         content.append(self.stack)
+        content.append(self.progress)
         content.append(self.status)
         split = Gtk.Box(spacing=0)
         split.append(sidebar)
@@ -169,155 +180,27 @@ class Settings(Gtk.ApplicationWindow):
         browse.connect("clicked", lambda _b: self.choose_file(entry))
         return entry, row(entry, browse)
 
-    def recognition_page(self):
-        page = box(10)
-        stt = effective(self.conf, "STT", "dictationStt") or STT_CLOUD_DEFAULT_FULL
-        cloud = stt.startswith("openrouter:")
+    # ─────────────────────────── фоновые задачи ───────────────────────────
+    # Загрузки и установка пакетов идут через whisper-dictate-setup в фоне:
+    # строки «PROGRESS N» двигают полосу, остальные строки — в строку статуса.
+    # Пока задача идёт, страницы недоступны, чтобы не запустить вторую.
 
-        self.stt_local = Gtk.CheckButton(label="Только локально (whisper.cpp)", active=not cloud)
-        self.stt_cloud = Gtk.CheckButton(label="Облако: OpenRouter", group=self.stt_local, active=cloud)
-        self.stt_model = Gtk.Entry(text=stt.split(":", 1)[1] if cloud else "",
-                                   placeholder_text=STT_CLOUD_DEFAULT, hexpand=True)
-        save_stt = Gtk.Button(label="Сохранить распознавание", halign=Gtk.Align.START)
-        save_stt.connect("clicked", self.save_stt)
-
-        self.model_entry, model_row = self.file_row(model_path(self.conf, "MODEL", "ggml-large-v3-turbo.bin"),
-                                                    "/путь/к/ggml-medium.bin")
-        self.vad_entry, vad_row = self.file_row(model_path(self.conf, "VAD_MODEL", "ggml-silero-v5.1.2.bin"),
-                                                "/путь/к/silero-vad.onnx")
-        save_models = Gtk.Button(label="Сохранить пути к моделям", halign=Gtk.Align.START)
-        save_models.connect("clicked", self.save_models)
-
-        page.append(heading("Распознавание речи"))
-        page.append(self.stt_local)
-        page.append(self.stt_cloud)
-        page.append(row(Gtk.Label(label="Модель OpenRouter", xalign=0), self.stt_model))
-        page.append(hint("Облако работает только с ключом OpenRouter. Если облако не ответило, кусок распознаётся локально."))
-        page.append(save_stt)
-        page.append(heading("Локальные модели whisper.cpp"))
-        page.append(hint("Модели не скачиваются: укажите файлы, которые уже есть на диске."))
-        page.append(row(Gtk.Label(label="Основная модель", xalign=0, width_chars=16), model_row))
-        page.append(row(Gtk.Label(label="VAD-модель", xalign=0, width_chars=16), vad_row))
-        page.append(save_models)
-        return page
-
-    def save_stt(self, _button):
-        if self.stt_cloud.get_active():
-            model = self.stt_model.get_text().strip() or STT_CLOUD_DEFAULT
-            self.save_setting("STT", "dictationStt", f"openrouter:{model}")
-        else:
-            self.save_setting("STT", "dictationStt", "local")
-
-    def save_models(self, _button):
-        for key, entry in (("MODEL", self.model_entry), ("VAD_MODEL", self.vad_entry)):
-            path = entry.get_text().strip()
-            if path:
-                self.write_conf(key, path)
-
-    def translation_page(self):
-        page = box(10)
-        current = effective(self.conf, "TRANSLATE_PROVIDER", "dictationProvider") or "gemini"
-        self.translate_buttons = []
-        group = None
-        page.append(heading("Провайдер перевода"))
-        page.append(hint("Перевод нужен, когда раскладка не русская. Пустой выбор диктовка понимает как Google Gemini."))
-        for value, label in TRANSLATE_CHOICES:
-            button = Gtk.CheckButton(label=label, group=group, active=value == current)
-            if group is None:
-                group = button
-            self.translate_buttons.append((value, button))
-            page.append(button)
-
-        self.gemini_model = Gtk.Entry(text=effective(self.conf, "GEMINI_MODEL", "geminiDictationModel"),
-                                      hexpand=True, placeholder_text="__auto__ — выбрать модель автоматически")
-        self.local_model = Gtk.Entry(text=stored("dictationLocalModel"), hexpand=True,
-                                     placeholder_text="marian:<каталог> или ollama:<модель>")
-        self.translate_script, script_row = self.file_row(
-            self.conf.get("TRANSLATE_SCRIPT") or os.path.expanduser("~/.config/quickshell/ii/scripts/ai/local-translate.sh"),
-            "/путь/к/local-translate.sh")
-        save = Gtk.Button(label="Сохранить перевод", halign=Gtk.Align.START)
-        save.connect("clicked", self.save_translate)
-
-        page.append(row(Gtk.Label(label="Модель Gemini", xalign=0, width_chars=16), self.gemini_model))
-        page.append(row(Gtk.Label(label="Локальная модель", xalign=0, width_chars=16), self.local_model))
-        page.append(hint("Локальная модель нужна для провайдера «Локальный перевод». Пусто — берётся общая модель локального перевода из Quickshell."))
-        page.append(row(Gtk.Label(label="Скрипт локального перевода", xalign=0, width_chars=16), script_row))
-        page.append(save)
-        self.opus_section(page)
-        return page
-
-    def opus_section(self, page):
-        page.append(heading("Модели OPUS-MT (локальный перевод)"))
-        page.append(hint("Готовые модели CTranslate2 int8, по ~240 МБ, работают на процессоре. "
-                         "В поле «Локальная модель» для них укажите marian:opus-tc-big."))
-        self.mt_dir = Gtk.Entry(text=self.conf.get("MT_MODEL_DIR") or "~/.local/share/whisper-dictate/mt-models",
-                                hexpand=True)
-        browse = Gtk.Button(label="Выбрать папку…")
-        browse.connect("clicked", self.choose_mt_dir)
-        save = Gtk.Button(label="Сохранить")
-        save.connect("clicked", self.save_mt_dir)
-        page.append(row(Gtk.Label(label="Папка моделей", xalign=0, width_chars=16), self.mt_dir, browse, save))
-
-        self.mt_rows = {}
-        for key, title, action in (("zle-en", "Русский → английский", "Скачать"),
-                                   ("en-zle", "Английский → русский", "Скачать"),
-                                   ("engine", "Движок ctranslate2", "Установить")):
-            state = Gtk.Label(xalign=0, hexpand=True)
-            button = Gtk.Button(label=action)
-            button.connect("clicked", self.run_mt, key)
-            self.mt_rows[key] = (state, button)
-            page.append(row(Gtk.Label(label=title, xalign=0, width_chars=22), state, button))
-        self.mt_progress = Gtk.ProgressBar(show_text=True, visible=False)
-        page.append(self.mt_progress)
-        self.mt_busy = False
-        self.refresh_mt()
-
-    def choose_mt_dir(self, _button):
-        dialog = Gtk.FileDialog(title="Папка для моделей OPUS-MT")
-
-        def done(dlg, result):
-            try:
-                self.mt_dir.set_text(dlg.select_folder_finish(result).get_path())
-                self.save_mt_dir(None)
-            except GLib.Error:
-                pass
-
-        dialog.select_folder(self, None, done)
-
-    def save_mt_dir(self, _button):
-        if self.write_conf("MT_MODEL_DIR", self.mt_dir.get_text().strip()):
-            self.refresh_mt()
-
-    def refresh_mt(self):
-        rc, out = setup("mt", "status")
-        states = {}
-        for line in out.splitlines():
-            parts = line.split(" ", 2)
-            if len(parts) >= 2:
-                states[parts[0]] = parts[1]
-        for key, (state, button) in self.mt_rows.items():
-            ok = states.get(key) == "ok"
-            state.set_text("установлено" if ok else ("нет" if rc == 0 else "не удалось проверить"))
-            button.set_sensitive(not ok and not self.mt_busy)
-
-    def run_mt(self, _button, key):
-        if self.mt_busy:
+    def run_job(self, args, on_done=None):
+        if self.busy:
+            self.say("Дождитесь окончания текущей задачи.")
             return
-        if self.mt_dir.get_text().strip() != (self.conf.get("MT_MODEL_DIR") or ""):
-            if not self.write_conf("MT_MODEL_DIR", self.mt_dir.get_text().strip()):
-                return
-        args = [SETUP, "mt", "engine"] if key == "engine" else [SETUP, "mt", "download", key]
         try:
-            proc = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+            proc = Gio.Subprocess.new([SETUP, *args],
+                                      Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
         except GLib.Error as err:
             self.say(f"Не удалось запустить: {err.message}")
             return
-        self.mt_busy = True
-        self.refresh_mt()
-        self.mt_progress.set_fraction(0)
-        self.mt_progress.set_text("0 %")
-        self.mt_progress.set_visible(True)
-        self.say("Идёт установка, окно можно не закрывать…")
+        self.busy = True
+        self.stack.set_sensitive(False)
+        self.progress.set_fraction(0)
+        self.progress.set_text("")
+        self.progress.set_visible(True)
+        self.say("Выполняется…")
         stream = Gio.DataInputStream.new(proc.get_stdout_pipe())
         last = []
 
@@ -331,8 +214,8 @@ class Settings(Gtk.ApplicationWindow):
                 return
             if line.startswith("PROGRESS "):
                 pct = int(line.split()[1])
-                self.mt_progress.set_fraction(pct / 100)
-                self.mt_progress.set_text(f"{pct} %")
+                self.progress.set_fraction(pct / 100)
+                self.progress.set_text(f"{pct} %")
             elif line.strip():
                 last.append(line.strip())
                 self.say(line.strip())
@@ -340,13 +223,342 @@ class Settings(Gtk.ApplicationWindow):
 
         def on_exit(p, result):
             p.wait_finish(result)
-            self.mt_busy = False
-            self.mt_progress.set_visible(False)
             ok = p.get_exit_status() == 0
+            self.busy = False
+            self.stack.set_sensitive(True)
+            self.progress.set_visible(False)
             self.say(("Готово. " if ok else "Ошибка. ") + (last[-1] if last else ""))
-            self.refresh_mt()
+            if on_done:
+                on_done(ok)
 
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
+
+    def read_async(self, args, on_done):
+        """Короткая команда без блокировки окна (например, список моделей из сети)."""
+        proc = Gio.Subprocess.new([SETUP, *args], Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+
+        def done(p, result):
+            try:
+                _ok, out, _err = p.communicate_utf8_finish(result)
+            except GLib.Error:
+                out = ""
+            on_done(out or "")
+
+        proc.communicate_utf8_async(None, None, done)
+
+    def choose_folder(self, entry, on_chosen=None):
+        dialog = Gtk.FileDialog(title="Выберите папку")
+
+        def done(dlg, result):
+            try:
+                entry.set_text(dlg.select_folder_finish(result).get_path())
+            except GLib.Error:
+                return
+            if on_chosen:
+                on_chosen()
+
+        dialog.select_folder(self, None, done)
+
+    def folder_row(self, value, on_chosen):
+        entry = Gtk.Entry(text=value, hexpand=True)
+        browse = Gtk.Button(label="Выбрать папку…")
+        browse.connect("clicked", lambda _b: self.choose_folder(entry, on_chosen))
+        entry.connect("activate", lambda _e: on_chosen())
+        return entry, row(entry, browse)
+
+    # ─────────────────────────── распознавание ────────────────────────────
+
+    def recognition_page(self):
+        page = box(10)
+        stt = effective(self.conf, "STT", "dictationStt") or STT_CLOUD_DEFAULT_FULL
+        cloud = stt.startswith("openrouter:")
+
+        page.append(heading("Где распознавать речь"))
+        self.stt_cloud = Gtk.CheckButton(label="В облаке (OpenRouter) — нужен ключ и баланс от $0.50", active=cloud)
+        self.stt_local = Gtk.CheckButton(label="На этом компьютере (whisper.cpp)", group=self.stt_cloud,
+                                         active=not cloud)
+        page.append(self.stt_cloud)
+        page.append(self.stt_local)
+        page.append(hint("В облачном режиме кусок, на который облако не ответило, распознаётся локально — "
+                         "поэтому локальную модель стоит скачать в любом случае."))
+
+        page.append(heading("Облачная модель"))
+        self.cloud_ids = []
+        self.cloud_list = Gtk.DropDown.new_from_strings(["Загружаю список…"])
+        self.cloud_list.set_hexpand(True)
+        self.cloud_list.connect("notify::selected", self.cloud_selected)
+        refresh = Gtk.Button(label="Обновить список")
+        refresh.connect("clicked", lambda _b: self.load_cloud_models(True))
+        page.append(row(self.cloud_list, refresh))
+        self.stt_model = Gtk.Entry(text=stt.split(":", 1)[1] if cloud else STT_CLOUD_DEFAULT, hexpand=True,
+                                   placeholder_text=STT_CLOUD_DEFAULT)
+        page.append(row(Gtk.Label(label="Идентификатор", xalign=0, width_chars=16), self.stt_model))
+        page.append(hint("Список — все модели распознавания OpenRouter с ценой за минуту. "
+                         "Можно вписать любую другую модель вручную."))
+
+        page.append(heading("Ускоритель для локального распознавания"))
+        rc, out = setup("gpu")
+        info = dict(line.split(" ", 1) for line in out.splitlines() if " " in line) if rc == 0 else {}
+        vendor = {"amd": "AMD", "nvidia": "NVIDIA", "intel": "Intel"}.get(info.get("gpu"), "не найдена")
+        recommended = info.get("recommended", "cpu")
+        page.append(hint(f"Видеокарта: {vendor}. Рекомендуется: {ACCEL_TITLES.get(recommended, recommended)}."))
+        current = self.conf.get("WHISPER_BACKEND") or "auto"
+        self.accel_values = [value for value, _title in ACCEL_CHOICES]
+        self.accel_list = Gtk.DropDown.new_from_strings(
+            [f"{title} ({ACCEL_TITLES.get(recommended, recommended)})" if value == "auto" else title
+             for value, title in ACCEL_CHOICES])
+        self.accel_list.set_selected(self.accel_values.index(current) if current in self.accel_values else 0)
+        page.append(row(Gtk.Label(label="Считать на", xalign=0, width_chars=16), self.accel_list))
+        self.accel_rows = {}
+        for name in ("vulkan", "hip", "cuda"):
+            state = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+            button = Gtk.Button(label="Установить")
+            button.connect("clicked", lambda _b, n=name: self.run_job(["accel", "install", n],
+                                                                       lambda _ok: self.refresh_accel()))
+            self.accel_rows[name] = (state, button)
+            page.append(row(Gtk.Label(label=ACCEL_TITLES[name], xalign=0, width_chars=16), state, button))
+        page.append(hint("Установка пакета спросит пароль системы. Если выбранный ускоритель не установлен, "
+                         "whisper считает на процессоре."))
+
+        page.append(heading("Локальные модели whisper"))
+        self.model_dir, dir_row = self.folder_row(os.path.expanduser(self.conf.get("MODEL_DIR") or DEFAULT_MODEL_DIR),
+                                                  self.save_model_dir)
+        page.append(row(Gtk.Label(label="Папка моделей", xalign=0, width_chars=16), dir_row))
+        self.whisper_rows = {}
+        group = None
+        chosen = os.path.basename(self.conf.get("MODEL") or "ggml-large-v3-turbo.bin")
+        for name, title in WHISPER_CHOICES:
+            pick = Gtk.CheckButton(label=title, group=group, active=name == chosen, hexpand=True)
+            group = group or pick
+            state = Gtk.Label(xalign=0, width_chars=14)
+            button = Gtk.Button(label="Скачать")
+            button.connect("clicked", self.download_whisper, name)
+            self.whisper_rows[name] = (pick, state, button)
+            page.append(row(pick, state, button))
+        vad_state = Gtk.Label(xalign=0, width_chars=14)
+        vad_button = Gtk.Button(label="Скачать")
+        vad_button.connect("clicked", self.download_whisper, VAD_NAME)
+        self.whisper_rows[VAD_NAME] = (None, vad_state, vad_button)
+        page.append(row(Gtk.Label(label="VAD — обрезка тишины (нужна всегда)", xalign=0, hexpand=True),
+                        vad_state, vad_button))
+        custom = self.conf.get("MODEL", "") if "/" in self.conf.get("MODEL", "") else ""
+        self.model_entry, model_row = self.file_row(custom, "или свой файл ggml-*.bin (необязательно)")
+        page.append(row(Gtk.Label(label="Свой файл", xalign=0, width_chars=16), model_row))
+
+        save = Gtk.Button(label="Сохранить распознавание", halign=Gtk.Align.START, margin_top=8)
+        save.add_css_class("suggested-action")
+        save.connect("clicked", self.save_stt)
+        page.append(save)
+
+        self.refresh_accel()
+        self.refresh_whisper()
+        self.load_cloud_models(False)
+        return page
+
+    def load_cloud_models(self, refresh):
+        def done(out):
+            items = [line.split("\t") for line in out.splitlines() if "\t" in line]
+            if not items:
+                self.say("Не удалось получить список моделей OpenRouter.")
+                return
+            current = self.stt_model.get_text().strip() or STT_CLOUD_DEFAULT
+            # Замена списка сама выбирает первый пункт — не даём ей затереть сохранённую модель.
+            self.cloud_ids = []
+            labels = [f"{item[1]}  {item[2]}".strip() for item in items]
+            self.cloud_list.set_model(Gtk.StringList.new(labels))
+            self.cloud_ids = [item[0] for item in items]
+            if current in self.cloud_ids:
+                self.cloud_list.set_selected(self.cloud_ids.index(current))
+            else:
+                self.stt_model.set_text(current)
+
+        self.read_async(["stt-models", *(["--refresh"] if refresh else [])], done)
+
+    def cloud_selected(self, dropdown, _param):
+        index = dropdown.get_selected()
+        if 0 <= index < len(self.cloud_ids):
+            self.stt_model.set_text(self.cloud_ids[index])
+
+    def refresh_accel(self):
+        rc, out = setup("accel", "status")
+        states = {line.split(" ")[0]: line.split(" ")[1] for line in out.splitlines() if " " in line}
+        for name, (state, button) in self.accel_rows.items():
+            ok = states.get(name) == "ok"
+            state.set_text("установлен" if ok else ("не установлен" if rc == 0 else "не удалось проверить"))
+            button.set_visible(not ok)
+
+    def save_model_dir(self):
+        if self.write_conf("MODEL_DIR", self.model_dir.get_text().strip()):
+            self.refresh_whisper()
+
+    def refresh_whisper(self):
+        rc, out = setup("whisper-models", "status")
+        states = {}
+        for line in out.splitlines():
+            parts = line.split(" ", 3)
+            if len(parts) >= 3 and parts[0] != "dir":
+                states[parts[0]] = (parts[1] == "ok", int(parts[2]))
+        for name, (pick, state, button) in self.whisper_rows.items():
+            ok, size = states.get(name, (False, 0))
+            state.set_text("скачана" if ok else f"{size / 1e9:.1f} ГБ" if size >= 1e9 else f"{size / 1e6:.0f} МБ" if size >= 1e7 else f"{size / 1e6:.1f} МБ")
+            button.set_visible(not ok)
+            if pick is not None:
+                pick.set_sensitive(ok)
+
+    def download_whisper(self, _button, name):
+        if self.model_dir.get_text().strip() != os.path.expanduser(self.conf.get("MODEL_DIR") or DEFAULT_MODEL_DIR):
+            if not self.write_conf("MODEL_DIR", self.model_dir.get_text().strip()):
+                return
+        self.run_job(["whisper-models", "download", name], lambda _ok: self.refresh_whisper())
+
+    def save_stt(self, _button):
+        if self.stt_cloud.get_active():
+            model = self.stt_model.get_text().strip() or STT_CLOUD_DEFAULT
+            self.save_setting("STT", "dictationStt", f"openrouter:{model}")
+        else:
+            self.save_setting("STT", "dictationStt", "local")
+        self.write_conf("WHISPER_BACKEND", self.accel_values[self.accel_list.get_selected()])
+        custom = self.model_entry.get_text().strip()
+        picked = next((name for name, (pick, _s, _b) in self.whisper_rows.items()
+                       if pick is not None and pick.get_active()), None)
+        if custom:
+            self.write_conf("MODEL", custom)
+        elif picked:
+            self.write_conf("MODEL", picked)
+        self.say("Распознавание сохранено.")
+
+    # ───────────────────────────── перевод ────────────────────────────────
+
+    def translation_page(self):
+        page = box(10)
+        current = effective(self.conf, "TRANSLATE_PROVIDER", "dictationProvider") or "gemini"
+        self.translate_buttons = []
+        group = None
+        page.append(heading("Провайдер перевода"))
+        page.append(hint("Перевод нужен, когда раскладка не русская."))
+        for value, label in TRANSLATE_CHOICES:
+            button = Gtk.CheckButton(label=label, group=group, active=value == current)
+            group = group or button
+            self.translate_buttons.append((value, button))
+            page.append(button)
+        self.gemini_model = Gtk.Entry(text=effective(self.conf, "GEMINI_MODEL", "geminiDictationModel"),
+                                      hexpand=True, placeholder_text="__auto__ — выбрать модель автоматически")
+        page.append(row(Gtk.Label(label="Модель Gemini", xalign=0, width_chars=16), self.gemini_model))
+        page.append(hint("Ключи DeepL и Gemini — на странице «API-ключи»."))
+
+        local = stored("dictationLocalModel")
+        page.append(heading("Локальный перевод: чем переводить"))
+        self.local_opus = Gtk.CheckButton(label="OPUS-MT — на процессоре, быстро, только русский ↔ английский",
+                                          active=not local.startswith("ollama:"))
+        self.local_ollama = Gtk.CheckButton(label="Ollama — языковая модель на видеокарте, любые языки",
+                                            group=self.local_opus, active=local.startswith("ollama:"))
+        page.append(self.local_opus)
+        page.append(self.local_ollama)
+
+        page.append(heading("OPUS-MT"))
+        self.mt_dir, dir_row = self.folder_row(
+            os.path.expanduser(self.conf.get("MT_MODEL_DIR") or DEFAULT_MT_DIR), self.save_mt_dir)
+        page.append(row(Gtk.Label(label="Папка моделей", xalign=0, width_chars=16), dir_row))
+        self.mt_rows = {}
+        for key, title, action in (("zle-en", "Русский → английский (240 МБ)", "Скачать"),
+                                   ("en-zle", "Английский → русский (240 МБ)", "Скачать"),
+                                   ("engine", "Движок ctranslate2", "Установить")):
+            state = Gtk.Label(xalign=0, hexpand=True)
+            button = Gtk.Button(label=action)
+            button.connect("clicked", self.run_mt, key)
+            self.mt_rows[key] = (state, button)
+            page.append(row(Gtk.Label(label=title, xalign=0, width_chars=30), state, button))
+
+        page.append(heading("Ollama"))
+        self.ollama_state = Gtk.Label(xalign=0, wrap=True)
+        page.append(self.ollama_state)
+        rc, out = setup("gpu")
+        recommended = {"vulkan": "vulkan", "cuda": "cuda"}.get(
+            dict(line.split(" ", 1) for line in out.splitlines() if " " in line).get("recommended"), "cpu")
+        self.ollama_variants = [value for value, _title in OLLAMA_CHOICES]
+        self.ollama_variant = Gtk.DropDown.new_from_strings([title for _value, title in OLLAMA_CHOICES])
+        self.ollama_variant.set_selected(self.ollama_variants.index(recommended))
+        self.ollama_install = Gtk.Button(label="Установить Ollama")
+        self.ollama_install.connect("clicked", lambda _b: self.run_job(
+            ["ollama", "install", self.ollama_variants[self.ollama_variant.get_selected()]],
+            lambda _ok: self.refresh_ollama()))
+        page.append(row(Gtk.Label(label="Ускоритель", xalign=0, width_chars=16), self.ollama_variant,
+                        self.ollama_install))
+        self.ollama_names = []
+        self.ollama_models = Gtk.DropDown.new_from_strings(["—"])
+        self.ollama_models.set_hexpand(True)
+        page.append(row(Gtk.Label(label="Модель", xalign=0, width_chars=16), self.ollama_models))
+        self.ollama_pull_name = Gtk.Entry(hexpand=True, placeholder_text="например hunyuan-mt:7b или qwen2.5:7b")
+        pull = Gtk.Button(label="Скачать модель")
+        pull.connect("clicked", self.pull_ollama)
+        page.append(row(Gtk.Label(label="Скачать", xalign=0, width_chars=16), self.ollama_pull_name, pull))
+        self.ollama_current = local.split(":", 1)[1] if local.startswith("ollama:") else ""
+
+        page.append(heading("Дополнительно"))
+        self.translate_script, script_row = self.file_row(
+            self.conf.get("TRANSLATE_SCRIPT") or os.path.expanduser("~/.config/quickshell/ii/scripts/ai/local-translate.sh"),
+            "/путь/к/local-translate.sh")
+        page.append(row(Gtk.Label(label="Скрипт перевода", xalign=0, width_chars=16), script_row))
+
+        save = Gtk.Button(label="Сохранить перевод", halign=Gtk.Align.START, margin_top=8)
+        save.add_css_class("suggested-action")
+        save.connect("clicked", self.save_translate)
+        page.append(save)
+        self.refresh_mt()
+        self.refresh_ollama()
+        return page
+
+    def save_mt_dir(self):
+        if self.write_conf("MT_MODEL_DIR", self.mt_dir.get_text().strip()):
+            self.refresh_mt()
+
+    def refresh_mt(self):
+        rc, out = setup("mt", "status")
+        states = {line.split(" ")[0]: line.split(" ")[1] for line in out.splitlines() if " " in line}
+        for key, (state, button) in self.mt_rows.items():
+            ok = states.get(key) == "ok"
+            state.set_text("установлено" if ok else ("нет" if rc == 0 else "не удалось проверить"))
+            button.set_visible(not ok)
+
+    def run_mt(self, _button, key):
+        if self.mt_dir.get_text().strip() != os.path.expanduser(self.conf.get("MT_MODEL_DIR") or DEFAULT_MT_DIR):
+            if not self.write_conf("MT_MODEL_DIR", self.mt_dir.get_text().strip()):
+                return
+        self.run_job(["mt", "engine"] if key == "engine" else ["mt", "download", key], lambda _ok: self.refresh_mt())
+
+    def refresh_ollama(self):
+        rc, out = setup("ollama", "status")
+        info, models = {}, []
+        for line in out.splitlines():
+            parts = line.split(" ")
+            if parts[0] == "model" and len(parts) >= 3:
+                models.append((parts[1], int(parts[2])))
+            elif parts[0] == "variant" and len(parts) >= 3:
+                info[f"variant-{parts[1]}"] = parts[2]
+            elif len(parts) >= 2:
+                info[parts[0]] = parts[1]
+        variants = [v for v in ("vulkan", "rocm", "cuda") if info.get(f"variant-{v}") == "ok"]
+        if info.get("installed") != "yes":
+            text = "Ollama не установлена. Выберите ускоритель и нажмите «Установить Ollama»."
+        elif info.get("service") != "up":
+            text = "Ollama установлена, но служба не запущена. «Установить Ollama» включит её."
+        else:
+            text = f"Ollama работает, ускоритель: {', '.join(variants) or 'процессор'}, моделей: {len(models)}."
+        self.ollama_state.set_text(text)
+        self.ollama_install.set_label("Добавить ускоритель" if info.get("service") == "up" else "Установить Ollama")
+        self.ollama_names = [name for name, _size in models]
+        labels = [f"{name}  ({size / 1e9:.1f} ГБ)" for name, size in models] or ["нет моделей"]
+        self.ollama_models.set_model(Gtk.StringList.new(labels))
+        if self.ollama_current in self.ollama_names:
+            self.ollama_models.set_selected(self.ollama_names.index(self.ollama_current))
+
+    def pull_ollama(self, _button):
+        name = self.ollama_pull_name.get_text().strip()
+        if not name:
+            self.say("Впишите имя модели Ollama.")
+            return
+        self.ollama_current = name if ":" in name else f"{name}:latest"
+        self.run_job(["ollama", "pull", name], lambda _ok: self.refresh_ollama())
 
     def save_translate(self, _button):
         chosen = next(value for value, button in self.translate_buttons if button.get_active())
@@ -354,12 +566,19 @@ class Settings(Gtk.ApplicationWindow):
         gemini = self.gemini_model.get_text().strip()
         if gemini:
             self.save_setting("GEMINI_MODEL", "geminiDictationModel", gemini)
-        local = self.local_model.get_text().strip()
-        if local:
-            self.save_setting("", "dictationLocalModel", local)
+        if self.local_ollama.get_active():
+            index = self.ollama_models.get_selected()
+            if 0 <= index < len(self.ollama_names):
+                self.save_setting("", "dictationLocalModel", f"ollama:{self.ollama_names[index]}")
+            elif chosen == "local":
+                self.say("Для Ollama выберите или скачайте модель.")
+                return
+        else:
+            self.save_setting("", "dictationLocalModel", "marian:opus-tc-big")
         script = self.translate_script.get_text().strip()
         if script:
             self.write_conf("TRANSLATE_SCRIPT", script)
+        self.say("Перевод сохранён.")
 
     def keys_page(self):
         page = box(12)

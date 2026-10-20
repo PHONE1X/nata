@@ -13,6 +13,10 @@
 #   whisper-dictate-setup doctor [--fix] [--yes]    дубли в кейринге
 #   whisper-dictate-setup mt status|download zle-en|en-zle|engine
 #                                  модели OPUS-MT для локального перевода
+#   whisper-dictate-setup whisper-models status|download NAME   модели whisper и VAD
+#   whisper-dictate-setup accel status|install vulkan|hip|cuda   ускоритель whisper
+#   whisper-dictate-setup ollama status|install VARIANT|pull NAME
+#   whisper-dictate-setup gpu | stt-models [--refresh]
 #
 # Секреты читаются только со stdin / скрытым вводом, в argv не передаются.
 
@@ -97,6 +101,12 @@ switch "$args[1]"
         exit $status
     case mt
         wd_mt $args[2..-1]
+        exit $status
+    case gpu accel ollama stt-models
+        wd_engines $args
+        exit $status
+    case whisper-models
+        wd_engines whisper --dir (string replace -r '^~' $HOME -- (wd_model_dir)) $args[2..-1]
         exit $status
     case ''
         test $mode = auto; and set mode (pick_mode)

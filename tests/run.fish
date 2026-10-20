@@ -182,6 +182,27 @@ check "mt: загрузка zle-en" string match -q 'zle-en ok*' -- ($S mt statu
 check "mt: нет .part после загрузки" not test -e $MT/opus-tc-big/zle-en.part
 check "mt: en-zle по-прежнему нет" string match -q 'en-zle missing*' -- ($S mt status)
 
+echo "== модели whisper и ускоритель"
+set -l WM $T/wm
+$S conf MODEL_DIR $WM >/dev/null
+check "whisper: VAD нет" string match -q 'ggml-silero-v5.1.2.bin missing*' -- ($S whisper-models status)
+set -l VSRV $T/hf/ggml-org/whisper-vad/resolve/main
+mkdir -p $VSRV
+head -c 885098 /dev/zero >$VSRV/ggml-silero-v5.1.2.bin
+WD_HF_BASE_URL=file://$T/hf $S whisper-models download ggml-silero-v5.1.2.bin >/dev/null 2>&1
+check "whisper: VAD скачан" string match -q 'ggml-silero-v5.1.2.bin ok*' -- ($S whisper-models status)
+set -l BSRV $T/hf/ggerganov/whisper.cpp/resolve/main
+mkdir -p $BSRV
+echo x >$BSRV/ggml-tiny.bin
+check "whisper: неверный размер — ошибка" not env WD_HF_BASE_URL=file://$T/hf $S whisper-models download ggml-tiny.bin
+check "whisper: нет недокачанного файла" not test -e $WM/ggml-tiny.bin.part
+check "whisper: неизвестная модель" not $S whisper-models download nope.bin
+mkdir -p $T/ggml
+touch $T/ggml/libggml-hip.so
+check "accel: hip найден" string match -q 'hip ok*' -- (env WD_GGML_DIR=$T/ggml $S accel status)
+check "accel: vulkan нет" string match -q 'vulkan missing*' -- (env WD_GGML_DIR=$T/ggml $S accel status)
+check "accel: установка через WD_PKEXEC" env WD_PKEXEC=true $S accel install vulkan
+
 echo
 echo "итого: ok=$pass fail=$failn  (песочница $T)"
 rm -rf $T

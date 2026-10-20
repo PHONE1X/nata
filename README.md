@@ -59,8 +59,8 @@ git clone https://github.com/PHONE1X/nata && cd nata/packaging/nata && makepkg -
 
 Окно настройки (`whisper-dictate-gui`) — основной способ. Все разделы в одном окне:
 
-- **Распознавание**: только локально или облако OpenRouter (с выбором модели); путь к основной модели `ggml-*.bin` и к VAD-модели выбирается файловым диалогом. Модели не скачиваются: укажите файлы, которые уже есть на диске.
-- **Перевод**: выключен, Gemini, DeepL или локальный скрипт; модель Gemini.
+- **Распознавание**: облако OpenRouter (выпадающий список всех моделей распознавания с ценой за минуту, или любая модель вручную) либо локально. Ускоритель: Авто / Vulkan / ROCm / CUDA / процессор; недостающий пакет (`ggml-vulkan`, `ggml-hip`, `ggml-cuda`) ставится кнопкой через окно пароля (pkexec). Модели whisper и VAD скачиваются кнопкой «Скачать» в выбранную папку.
+- **Перевод**: DeepL, Gemini или локально. Локально — OPUS-MT (ru↔en на процессоре, модели и движок скачиваются кнопкой) или Ollama (установка с нужным ускорителем, выбор и скачивание моделей).
 - **API-ключи**: OpenRouter, DeepL, Gemini. Поле скрытое, ключ уходит в libsecret (или в `secrets.env`, если libsecret недоступен).
 - **Горячая клавиша**: на Hyprland записывает привязку; на других окружениях показывает, где назначить команду `whisper-dictate`.
 - **Quickshell**: кнопки подключения виджета (см. ниже).
@@ -73,6 +73,10 @@ git clone https://github.com/PHONE1X/nata && cd nata/packaging/nata && makepkg -
 ```
 whisper-dictate-setup key openrouter                  # значение со stdin
 whisper-dictate-setup conf MODEL /путь/к/ggml-medium.bin
+whisper-dictate-setup whisper-models status|download ggml-large-v3-turbo.bin
+whisper-dictate-setup accel status|install vulkan|hip|cuda
+whisper-dictate-setup ollama status|install vulkan|rocm|cuda|cpu|pull NAME
+whisper-dictate-setup stt-models [--refresh]          # облачные модели OpenRouter
 whisper-dictate-setup bind apply --key "SUPER + U"    # Hyprland
 whisper-dictate-setup qs ii install                   # или: qs standalone install
 whisper-dictate-setup doctor [--fix]

@@ -13,6 +13,7 @@ set -g WD_KEYRING_PY $WD_LIBDIR/keyring-doctor.py
 set -g WD_BIND_PY $WD_LIBDIR/hypr-bind.py
 set -g WD_QS_PY $WD_LIBDIR/qs-integrate.py
 set -g WD_MT_PY $WD_LIBDIR/mt-models.py
+set -g WD_ENGINES_PY $WD_LIBDIR/engines.py
 source $WD_LIBDIR/wm.fish
 
 # ───────────────────────────── конфиг и секреты ────────────────────────────
@@ -155,11 +156,19 @@ function wd_mt
     python3 $WD_MT_PY --dir (wd_mt_dir) $argv
 end
 
-# GPU-бэкенд ggml (пакет ggml-vulkan и т.п.). Без него whisper-cli считает на процессоре.
+function wd_engines
+    python3 $WD_ENGINES_PY $argv
+end
+
+# GPU-бэкенд, на котором будет считать whisper: выбранный в WHISPER_BACKEND
+# (vulkan|hip|cuda|cpu) или, при auto, первый установленный пакет ggml-<имя>.
 function wd_gpu_backend
-    for b in vulkan cuda hip sycl
-        if test -e /usr/lib/ggml/libggml-$b.so; or test -e /usr/lib/libggml-$b.so
-            echo $b
+    set -l want (wd_conf WHISPER_BACKEND auto)
+    test "$want" = cpu; and return 1
+    for line in (wd_engines accel status)
+        set -l f (string split ' ' -- $line)
+        if test "$f[2]" = ok; and contains -- $want auto $f[1]
+            echo $f[1]
             return 0
         end
     end
@@ -204,7 +213,12 @@ function wd_selftest
     if set -l gpu (wd_gpu_backend)
         wd_t_ok "GPU для whisper: $gpu"
     else
-        wd_t_warn "whisper считает на процессоре, это медленно: sudo pacman -S ggml-vulkan"
+        set -l want (wd_conf WHISPER_BACKEND auto)
+        if test "$want" = cpu
+            wd_t_ok "whisper на процессоре (выбрано в настройках)"
+        else
+            wd_t_warn "ускоритель $want не установлен, whisper считает на процессоре: Nata → Распознавание → Ускоритель"
+        end
     end
     set -l mdir (wd_model_dir)
     set -l model (wd_conf MODEL ggml-large-v3-turbo.bin)

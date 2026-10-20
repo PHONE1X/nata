@@ -21,7 +21,8 @@ import os
 import shutil
 import subprocess
 import sys
-import urllib.request
+
+from wd_net import fetch, hf_url, remote_size
 
 FAMILY = "opus-tc-big"
 # Ревизии закреплены: сменится репозиторий на HuggingFace — скачается то же самое.
@@ -32,7 +33,6 @@ MODELS = {
                "английский → русский"),
 }
 FILES = ["config.json", "shared_vocabulary.json", "source.spm", "target.spm", "model.bin"]
-BASE_URL = os.environ.get("WD_MT_BASE_URL", "https://huggingface.co")
 ENGINE_PACKAGES = ["ctranslate2", "sentencepiece"]
 # ctranslate2 выпускает колёса не под каждый свежий Python; через uv берём проверенный.
 ENGINE_PYTHON = "3.12"
@@ -69,34 +69,6 @@ def status(root):
     return 0
 
 
-def fetch(url, dest, done, total):
-    request = urllib.request.Request(url, headers={"User-Agent": "nata-mt-models"})
-    with urllib.request.urlopen(request, timeout=60) as resp, open(dest, "wb") as out:
-        expected = resp.headers.get("Content-Length")
-        got = 0
-        while True:
-            chunk = resp.read(1 << 20)
-            if not chunk:
-                break
-            out.write(chunk)
-            got += len(chunk)
-            if total:
-                print(f"PROGRESS {min(99, (done + got) * 100 // total)}", flush=True)
-    if expected and int(expected) != got:
-        raise OSError(f"{os.path.basename(dest)}: получено {got} из {expected} байт")
-    return got
-
-
-def remote_size(url):
-    request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "nata-mt-models"})
-    try:
-        with urllib.request.urlopen(request, timeout=60) as resp:
-            # HuggingFace отдаёт размер файла из LFS/Xet в X-Linked-Size, до редиректа.
-            return int(resp.headers.get("X-Linked-Size") or resp.headers.get("Content-Length") or 0)
-    except (OSError, ValueError):
-        return 0
-
-
 def download(root, direction):
     repo, rev, title = MODELS[direction]
     final = model_dir(root, direction)
@@ -106,8 +78,8 @@ def download(root, direction):
     tmp = final + ".part"
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp, exist_ok=True)
-    urls = {f: f"{BASE_URL}/{repo}/resolve/{rev}/{f}" for f in FILES}
-    total = sum(remote_size(u) for u in urls.values()) if BASE_URL.startswith("http") else 0
+    urls = {f: hf_url(repo, rev, f) for f in FILES}
+    total = sum(remote_size(u) for u in urls.values())
     print(f"Скачиваю {direction} ({title}) из {repo}", flush=True)
     done = 0
     try:

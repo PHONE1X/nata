@@ -159,6 +159,24 @@ function dictate_model_path --argument-names name
     string match -q '*/*' -- $name; and echo $name; or echo $MODEL_DIR/$name
 end
 set -g MODEL (dictate_model_path (wd_conf MODEL ggml-large-v3-turbo.bin))
+
+# Ускоритель whisper (WHISPER_BACKEND): auto — первый установленный GPU-бэкенд
+# ggml; vulkan|hip|cuda — только он: у остальных прячем устройства, иначе ggml
+# возьмёт первый найденный; cpu — без видеокарты.
+set -g WHISPER_ENV
+set -g WHISPER_FLAGS
+set -l no_vk VK_DRIVER_FILES=/nonexistent.json VK_ICD_FILENAMES=/nonexistent.json
+set -l no_hip HIP_VISIBLE_DEVICES=-1 ROCR_VISIBLE_DEVICES=-1
+switch (wd_conf WHISPER_BACKEND auto)
+    case cpu
+        set WHISPER_FLAGS -ng
+    case vulkan
+        set WHISPER_ENV $no_hip CUDA_VISIBLE_DEVICES=-1
+    case hip
+        set WHISPER_ENV $no_vk CUDA_VISIBLE_DEVICES=-1
+    case cuda
+        set WHISPER_ENV $no_vk $no_hip
+end
 set -g VAD_MODEL (dictate_model_path (wd_conf VAD_MODEL ggml-silero-v5.1.2.bin))
 
 # ── защита от падения видеокарты на длинной записи ──────────────────────────
@@ -1405,7 +1423,7 @@ function dictate_whisper_once --argument-names wav out
     # тишину», и по тексту эти два случая неразличимы.
     set -g DICTATE_CHUNK_TEXT ""
     rm -f $out.txt
-    $WHISPER_BIN -m $MODEL -f $wav -l ru -nt -otxt -of $out \
+    env $WHISPER_ENV $WHISPER_BIN $WHISPER_FLAGS -m $MODEL -f $wav -l ru -nt -otxt -of $out \
         --prompt (dictate_prompt) \
         --vad --vad-model $VAD_MODEL >/dev/null 2>&1
     set -l rc $status
