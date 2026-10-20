@@ -22,7 +22,7 @@
 ## Требования
 
 - Wayland с `wl-clipboard`, `ydotool` (запущен `ydotoold`), PipeWire (`pw-record`), `ffmpeg`, `jq`, `fish`, `libsecret` (`secret-tool`), `libnotify`, `curl`.
-- Для локального распознавания: `whisper.cpp` (`whisper-cli`) и модель `ggml-*.bin`. Для GPU на AMD/Intel/NVIDIA удобнее собрать `whisper.cpp` с Vulkan (есть `packaging/whisper.cpp-vulkan`).
+- Для локального распознавания нужны `whisper-cpp` (`whisper-cli`, ставится из репозитория как зависимость пакета) и модели `ggml-*.bin`, которые уже лежат на диске. Модели не скачиваются.
 - Для GUI-настройки: `python-gobject` и `gtk4` (ставятся как зависимости пакета). Для TUI в терминале: `fzf`. Без него работает CLI.
 
 Привязки к окружению нет: основной сценарий работает на Hyprland, KDE Plasma, GNOME и других Wayland-окружениях. Quickshell не нужен.
@@ -38,8 +38,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/PHONE1X/nata/master/inst
 Или вручную из клона:
 
 ```
-git clone https://github.com/PHONE1X/nata && cd nata/packaging/whisper.cpp-vulkan && makepkg -si   # необязательно: GPU-whisper
-cd ../nata && makepkg -si
+git clone https://github.com/PHONE1X/nata && cd nata/packaging/nata && makepkg -si
 ```
 
 Публикация в AUR пока не сделана; когда появится, пакет будет ставиться через `paru -S nata`.

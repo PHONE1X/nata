@@ -8,10 +8,9 @@ pkgdesc='Nata: voice dictation for Wayland (whisper.cpp, optional cloud STT and 
 arch=(any)
 url='https://github.com/PHONE1X/nata'
 license=(MIT)
-depends=(fish jq python python-gobject gtk4 libsecret util-linux curl ffmpeg pipewire wl-clipboard libnotify ydotool)
+depends=(fish jq python python-gobject gtk4 libsecret util-linux curl ffmpeg pipewire wl-clipboard libnotify ydotool whisper-cpp)
 makedepends=()
-optdepends=('whisper.cpp-vulkan: GPU-accelerated local speech recognition (or any whisper-cli in PATH)'
-            'fzf: terminal setup menu (whisper-dictate-setup --tui)'
+optdepends=('fzf: terminal setup menu (whisper-dictate-setup --tui)'
             'quickshell: standalone widget and Quickshell integration')
 backup=(etc/whisper-dictate/dictate.conf)
 install=nata.install
