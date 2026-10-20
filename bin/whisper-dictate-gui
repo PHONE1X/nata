@@ -14,6 +14,8 @@ from gi.repository import Gio, GLib, Gtk
 SETUP = shutil.which("whisper-dictate-setup") or str(Path(__file__).resolve().parent / "whisper-dictate-setup")
 CONF = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "whisper-dictate" / "dictate.conf"
 STT_CLOUD_DEFAULT = "openai/gpt-4o-transcribe"
+# Как STT_DEFAULT в bin/whisper-dictate: без настройки распознавание идёт в облако.
+STT_CLOUD_DEFAULT_FULL = f"openrouter:{STT_CLOUD_DEFAULT}"
 KEY_SLOTS = [
     ("openrouter", "OpenRouter", "распознавание в облаке и перевод"),
     ("deepl", "DeepL", "перевод"),
@@ -169,7 +171,7 @@ class Settings(Gtk.ApplicationWindow):
 
     def recognition_page(self):
         page = box(10)
-        stt = effective(self.conf, "STT", "dictationStt") or "local"
+        stt = effective(self.conf, "STT", "dictationStt") or STT_CLOUD_DEFAULT_FULL
         cloud = stt.startswith("openrouter:")
 
         self.stt_local = Gtk.CheckButton(label="Только локально (whisper.cpp)", active=not cloud)
