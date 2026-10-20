@@ -11,6 +11,8 @@
 #                                  [--force] [--replace-legacy] [--dry-run]
 #   whisper-dictate-setup qs ii|standalone status|install|remove
 #   whisper-dictate-setup doctor [--fix] [--yes]    дубли в кейринге
+#   whisper-dictate-setup mt status|download zle-en|en-zle|engine
+#                                  модели OPUS-MT для локального перевода
 #
 # Секреты читаются только со stdin / скрытым вводом, в argv не передаются.
 
@@ -92,6 +94,9 @@ switch "$args[1]"
         exit $status
     case doctor
         wd_doctor $args[2..-1]
+        exit $status
+    case mt
+        wd_mt $args[2..-1]
         exit $status
     case ''
         test $mode = auto; and set mode (pick_mode)

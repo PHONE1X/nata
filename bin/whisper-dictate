@@ -678,7 +678,9 @@ function dictate_translate_local --argument-names ru_text
     # более качественная GPU-модель на длинных вставках, одной настройкой это
     # не покрывалось. Если своя настройка пуста, скрипт сам возьмёт общую.
     test -x "$LOCAL_TRANSLATE_SCRIPT"; or return 1
-    env LOCAL_TRANSLATE_SLOT=dictation $LOCAL_TRANSLATE_SCRIPT Russian English "$ru_text" 2>/dev/null
+    # Каталог OPUS-MT из настроек Nata (кнопки «Скачать» в GUI кладут модели туда).
+    set -l mt_dir (string replace -r '^~' $HOME -- (wd_conf MT_MODEL_DIR ~/.local/share/whisper-dictate/mt-models))
+    env LOCAL_TRANSLATE_SLOT=dictation MT_MODELS_DIR=$mt_dir $LOCAL_TRANSLATE_SCRIPT Russian English "$ru_text" 2>/dev/null
 end
 
 function dictate_translate_deepl --argument-names ru_text lang

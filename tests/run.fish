@@ -168,6 +168,20 @@ cp -r $QS/bad/ii $T/bad-before
 check "ii: якорь не найден — отказ" not python3 $repo/lib/qs-integrate.py ii install --dir $QS/bad
 check "ii: при отказе файлы не тронуты" diff -r $T/bad-before $QS/bad/ii
 
+echo "== OPUS-MT"
+set -l MT $T/mt
+$S conf MT_MODEL_DIR $MT >/dev/null
+check "mt: пустой каталог — модели нет" string match -q 'zle-en missing*' -- ($S mt status)
+set -l SRV $T/hf/luigi000/opus-mt-tc-big-zle-en-ct2-int8/resolve/987aa3c46cf871ea683bcc7a540e3053d372cb71
+mkdir -p $SRV
+for f in config.json shared_vocabulary.json source.spm target.spm model.bin
+    echo x >$SRV/$f
+end
+WD_MT_BASE_URL=file://$T/hf $S mt download zle-en >/dev/null 2>&1
+check "mt: загрузка zle-en" string match -q 'zle-en ok*' -- ($S mt status)
+check "mt: нет .part после загрузки" not test -e $MT/opus-tc-big/zle-en.part
+check "mt: en-zle по-прежнему нет" string match -q 'en-zle missing*' -- ($S mt status)
+
 echo
 echo "итого: ok=$pass fail=$failn  (песочница $T)"
 rm -rf $T

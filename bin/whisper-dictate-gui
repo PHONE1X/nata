@@ -243,7 +243,110 @@ class Settings(Gtk.ApplicationWindow):
         page.append(hint("Локальная модель нужна для провайдера «Локальный перевод». Пусто — берётся общая модель локального перевода из Quickshell."))
         page.append(row(Gtk.Label(label="Скрипт локального перевода", xalign=0, width_chars=16), script_row))
         page.append(save)
+        self.opus_section(page)
         return page
+
+    def opus_section(self, page):
+        page.append(heading("Модели OPUS-MT (локальный перевод)"))
+        page.append(hint("Готовые модели CTranslate2 int8, по ~240 МБ, работают на процессоре. "
+                         "В поле «Локальная модель» для них укажите marian:opus-tc-big."))
+        self.mt_dir = Gtk.Entry(text=self.conf.get("MT_MODEL_DIR") or "~/.local/share/whisper-dictate/mt-models",
+                                hexpand=True)
+        browse = Gtk.Button(label="Выбрать папку…")
+        browse.connect("clicked", self.choose_mt_dir)
+        save = Gtk.Button(label="Сохранить")
+        save.connect("clicked", self.save_mt_dir)
+        page.append(row(Gtk.Label(label="Папка моделей", xalign=0, width_chars=16), self.mt_dir, browse, save))
+
+        self.mt_rows = {}
+        for key, title, action in (("zle-en", "Русский → английский", "Скачать"),
+                                   ("en-zle", "Английский → русский", "Скачать"),
+                                   ("engine", "Движок ctranslate2", "Установить")):
+            state = Gtk.Label(xalign=0, hexpand=True)
+            button = Gtk.Button(label=action)
+            button.connect("clicked", self.run_mt, key)
+            self.mt_rows[key] = (state, button)
+            page.append(row(Gtk.Label(label=title, xalign=0, width_chars=22), state, button))
+        self.mt_progress = Gtk.ProgressBar(show_text=True, visible=False)
+        page.append(self.mt_progress)
+        self.mt_busy = False
+        self.refresh_mt()
+
+    def choose_mt_dir(self, _button):
+        dialog = Gtk.FileDialog(title="Папка для моделей OPUS-MT")
+
+        def done(dlg, result):
+            try:
+                self.mt_dir.set_text(dlg.select_folder_finish(result).get_path())
+                self.save_mt_dir(None)
+            except GLib.Error:
+                pass
+
+        dialog.select_folder(self, None, done)
+
+    def save_mt_dir(self, _button):
+        if self.write_conf("MT_MODEL_DIR", self.mt_dir.get_text().strip()):
+            self.refresh_mt()
+
+    def refresh_mt(self):
+        rc, out = setup("mt", "status")
+        states = {}
+        for line in out.splitlines():
+            parts = line.split(" ", 2)
+            if len(parts) >= 2:
+                states[parts[0]] = parts[1]
+        for key, (state, button) in self.mt_rows.items():
+            ok = states.get(key) == "ok"
+            state.set_text("установлено" if ok else ("нет" if rc == 0 else "не удалось проверить"))
+            button.set_sensitive(not ok and not self.mt_busy)
+
+    def run_mt(self, _button, key):
+        if self.mt_busy:
+            return
+        if self.mt_dir.get_text().strip() != (self.conf.get("MT_MODEL_DIR") or ""):
+            if not self.write_conf("MT_MODEL_DIR", self.mt_dir.get_text().strip()):
+                return
+        args = [SETUP, "mt", "engine"] if key == "engine" else [SETUP, "mt", "download", key]
+        try:
+            proc = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+        except GLib.Error as err:
+            self.say(f"Не удалось запустить: {err.message}")
+            return
+        self.mt_busy = True
+        self.refresh_mt()
+        self.mt_progress.set_fraction(0)
+        self.mt_progress.set_text("0 %")
+        self.mt_progress.set_visible(True)
+        self.say("Идёт установка, окно можно не закрывать…")
+        stream = Gio.DataInputStream.new(proc.get_stdout_pipe())
+        last = []
+
+        def on_line(src, result):
+            try:
+                line, _len = src.read_line_finish_utf8(result)
+            except GLib.Error:
+                line = None
+            if line is None:
+                proc.wait_async(None, on_exit)
+                return
+            if line.startswith("PROGRESS "):
+                pct = int(line.split()[1])
+                self.mt_progress.set_fraction(pct / 100)
+                self.mt_progress.set_text(f"{pct} %")
+            elif line.strip():
+                last.append(line.strip())
+                self.say(line.strip())
+            src.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
+
+        def on_exit(p, result):
+            p.wait_finish(result)
+            self.mt_busy = False
+            self.mt_progress.set_visible(False)
+            ok = p.get_exit_status() == 0
+            self.say(("Готово. " if ok else "Ошибка. ") + (last[-1] if last else ""))
+            self.refresh_mt()
+
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
 
     def save_translate(self, _button):
         chosen = next(value for value, button in self.translate_buttons if button.get_active())

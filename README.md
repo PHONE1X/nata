@@ -22,7 +22,9 @@
 ## Требования
 
 - Wayland с `wl-clipboard`, `ydotool` (запущен `ydotoold`), PipeWire (`pw-record`), `ffmpeg`, `jq`, `fish`, `libsecret` (`secret-tool`), `libnotify`, `curl`.
-- Для локального распознавания нужны `whisper-cpp` (`whisper-cli`, ставится из репозитория как зависимость пакета) и модели `ggml-*.bin`, которые уже лежат на диске. Модели не скачиваются.
+- Для локального распознавания нужны `whisper-cpp` (`whisper-cli`, ставится из репозитория как зависимость пакета) и модели `ggml-*.bin`, которые уже лежат на диске. Модели whisper не скачиваются.
+- Распознавание идёт на видеокарте через `ggml-vulkan` (зависимость пакета; AMD/Intel/NVIDIA). Без GPU whisper работает на процессоре, но в разы медленнее: `whisper-dictate --test` об этом предупредит.
+- Локальный перевод: модели OPUS-MT (русский ↔ английский, ~240 МБ каждая) и движок ctranslate2 ставятся кнопками в GUI на странице «Перевод» или командой `whisper-dictate-setup mt download zle-en|en-zle` / `mt engine`. Папка задаётся ключом `MT_MODEL_DIR`.
 - Для GUI-настройки: `python-gobject` и `gtk4` (ставятся как зависимости пакета). Для TUI в терминале: `fzf`. Без него работает CLI.
 
 Привязки к окружению нет: основной сценарий работает на Hyprland, KDE Plasma, GNOME и других Wayland-окружениях. Quickshell не нужен.

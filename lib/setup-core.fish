@@ -12,6 +12,7 @@ set -g WD_LIBDIR (dirname (realpath (status filename)))
 set -g WD_KEYRING_PY $WD_LIBDIR/keyring-doctor.py
 set -g WD_BIND_PY $WD_LIBDIR/hypr-bind.py
 set -g WD_QS_PY $WD_LIBDIR/qs-integrate.py
+set -g WD_MT_PY $WD_LIBDIR/mt-models.py
 source $WD_LIBDIR/wm.fish
 
 # ───────────────────────────── конфиг и секреты ────────────────────────────
@@ -145,6 +146,26 @@ function wd_model_dir
     wd_conf MODEL_DIR ~/.local/share/whisper-dictate/models
 end
 
+# Каталог OPUS-MT для локального перевода. Тот же путь читает local-translate.sh из ii.
+function wd_mt_dir
+    string replace -r '^~' $HOME -- (wd_conf MT_MODEL_DIR ~/.local/share/whisper-dictate/mt-models)
+end
+
+function wd_mt
+    python3 $WD_MT_PY --dir (wd_mt_dir) $argv
+end
+
+# GPU-бэкенд ggml (пакет ggml-vulkan и т.п.). Без него whisper-cli считает на процессоре.
+function wd_gpu_backend
+    for b in vulkan cuda hip sycl
+        if test -e /usr/lib/ggml/libggml-$b.so; or test -e /usr/lib/libggml-$b.so
+            echo $b
+            return 0
+        end
+    end
+    return 1
+end
+
 # ─────────────────────────────── Hyprland ──────────────────────────────────
 
 function wd_bind
@@ -179,7 +200,12 @@ function wd_selftest
     echo "Распознавание:"
     set -l wbin (wd_conf WHISPER_BIN whisper-cli)
     string match -q '*/*' -- $wbin; or set wbin (command -v $wbin; or echo /usr/bin/$wbin)
-    test -x $wbin; and wd_t_ok "whisper-cli: $wbin"; or wd_t_fail "whisper-cli не найден (пакет whisper.cpp-vulkan)"
+    test -x $wbin; and wd_t_ok "whisper-cli: $wbin"; or wd_t_fail "whisper-cli не найден (пакет whisper-cpp)"
+    if set -l gpu (wd_gpu_backend)
+        wd_t_ok "GPU для whisper: $gpu"
+    else
+        wd_t_warn "whisper считает на процессоре, это медленно: sudo pacman -S ggml-vulkan"
+    end
     set -l mdir (wd_model_dir)
     set -l model (wd_conf MODEL ggml-large-v3-turbo.bin)
     string match -q '*/*' -- $model; or set model $mdir/$model
@@ -188,6 +214,27 @@ function wd_selftest
     test -s $model; and wd_t_ok "модель: $model"; or wd_t_fail "нет модели $model (укажите путь в whisper-dictate-gui)"
     test -s $vad; and wd_t_ok "VAD: $vad"; or wd_t_fail "нет VAD-модели $vad (укажите путь в whisper-dictate-gui)"
     test -f (wd_conf SPLIT_SCRIPT $WD_LIBDIR/dictate-split.py); and wd_t_ok "dictate-split.py"; or wd_t_fail "dictate-split.py не найден"
+
+    echo "Локальный перевод (OPUS-MT):"
+    # Нужен только провайдеру «Локальный перевод»; при DeepL/Gemini отсутствие не ошибка.
+    set -l provider (wd_conf TRANSLATE_PROVIDER "")
+    test -n "$provider"; or set provider (wd_key_get dictationProvider 2>/dev/null)
+    for line in (wd_mt status 2>/dev/null)
+        set -l f (string split -m 2 ' ' -- $line)
+        switch $f[1]
+            case dir
+                echo "  каталог: $f[2]"
+            case zle-en en-zle engine
+                set -l what (test $f[1] = engine; and echo "движок ctranslate2"; or echo "модель $f[1] ($f[3])")
+                if test "$f[2]" = ok
+                    wd_t_ok $what
+                else if test "$provider" = local
+                    wd_t_warn "$what: нет (Nata → Перевод → скачать)"
+                else
+                    printf '  [ -- ] %s: нет, нужна только для локального перевода\n' $what
+                end
+        end
+    end
 
     echo "Ключи:"
     set -l have (wd_key_list)
