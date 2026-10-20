@@ -59,7 +59,7 @@ function wd_flow_models
         small "small (≈470 МБ)" \
         base "base (≈140 МБ)" \
         vad "Silero VAD (≈1 МБ, нужен всегда)" \
-        legacy "Подцепить модели из ~/whisper.cpp/models" \
+        legacy "Подцепить модели из ~/WORKSPACE/ai/whisper.cpp/models" \
         back "Назад")
     test -n "$pick"; and test "$pick" != back; or return 0
     if test "$pick" = legacy

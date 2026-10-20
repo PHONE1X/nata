@@ -189,11 +189,11 @@ function wd_model_download --argument-names name
     echo "Готово: $dst"
 end
 
-# Находит модели из прежней установки (~/whisper.cpp/models) и ссылается на них.
+# Находит модели из прежней установки (~/WORKSPACE/ai/whisper.cpp/models) и ссылается на них.
 function wd_model_link_legacy
     set -l dir (wd_model_dir)
     mkdir -p $dir
-    for f in ~/whisper.cpp/models/ggml-*.bin
+    for f in ~/WORKSPACE/ai/whisper.cpp/models/ggml-*.bin
         set -l base (basename $f)
         string match -q 'for-tests-*' -- $base; and continue
         if not test -e $dir/$base

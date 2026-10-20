@@ -685,7 +685,7 @@ function dictate_translate_local --argument-names ru_text
     # Бэкенд выбирается префиксом в .apiKeys.localTranslateModel (кейринг):
     # "ollama:<имя>" — модель на GPU через Ollama (load -> answer -> unload,
     # между вызовами в видеопамяти ничего не остаётся), "marian:<каталог>" —
-    # seq2seq-модель из ~/mt-models на CPU, через scripts/ai/marian-translate.py,
+    # seq2seq-модель из ~/WORKSPACE/ai/mt-models на CPU, через scripts/ai/marian-translate.py,
     # то есть вообще без GPU. Тот же скрипт, что использует sidebar-переводчик
     # с provider=local в ai-translate.sh, но модель у них теперь РАЗНАЯ:
     # LOCAL_TRANSLATE_SLOT=dictation заставляет скрипт читать
