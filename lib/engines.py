@@ -2,6 +2,7 @@
 """Движки whisper-dictate: ускоритель whisper, модели whisper, Ollama, облачные модели.
 
     engines.py gpu
+    engines.py plan
     engines.py accel status | install vulkan|hip|cuda
     engines.py whisper --dir DIR status | download NAME
     engines.py ollama status | install vulkan|rocm|cuda|cpu | pull NAME
@@ -53,8 +54,14 @@ OLLAMA_VARIANTS = {"vulkan": "ollama-vulkan", "rocm": "ollama-rocm", "cuda": "ol
 STT_URL = "https://openrouter.ai/api/v1/models?output_modalities=transcription"
 STT_CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
                          "whisper-dictate", "stt-models.json")
+# Облачная модель для автонастройки: лучше всех держит русский и знаки препинания.
+STT_BEST = "openai/gpt-4o-transcribe"
 STT_FALLBACK = ["openai/gpt-4o-transcribe", "openai/gpt-4o-mini-transcribe",
                 "openai/whisper-large-v3-turbo", "openai/whisper-large-v3"]
+# Порядок предпочтения для автонастройки: первая доступная модель и будет выбрана.
+STT_PREFERRED = ["openai/gpt-4o-transcribe", "openai/gpt-4o-mini-transcribe",
+                 "openai/whisper-large-v3-turbo", "elevenlabs/scribe-v2",
+                 "mistralai/voxtral-mini-transcribe-3-0"]
 
 
 def gpu_vendor():
@@ -66,6 +73,60 @@ def gpu_vendor():
         if vendor:
             return vendor
     return "none"
+
+
+def gpu_name():
+    try:
+        out = subprocess.run(["lspci", "-mm"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in out.splitlines():
+        if "VGA" in line or "3D controller" in line or "Display controller" in line:
+            parts = line.split('"')
+            if len(parts) >= 6:
+                return f"{parts[3]} {parts[5]}"
+    return ""
+
+
+def vram_gb(vendor):
+    if vendor == "nvidia":
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            return int(out.split()[0]) / 1024
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            return 0
+    best = 0
+    for path in glob.glob("/sys/class/drm/card*/device/mem_info_vram_total"):
+        try:
+            best = max(best, int(open(path).read()) / 2**30)
+        except (OSError, ValueError):
+            pass
+    return best
+
+
+def cpu_info():
+    name = ""
+    try:
+        for line in open("/proc/cpuinfo"):
+            if line.startswith("model name"):
+                name = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    ram = 0
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal:"):
+                ram = int(line.split()[1]) / 2**20
+    except (OSError, ValueError):
+        pass
+    return name, os.cpu_count() or 1, ram
+
+
+def cpu_model(threads, ram):
+    # На процессоре large-v3-turbo q5 укладывается в пару секунд на фразу от 8 потоков.
+    return "ggml-large-v3-turbo-q5_0.bin" if threads >= 8 and ram >= 8 else "ggml-small.bin"
 
 
 def pkg_installed(name):
@@ -91,6 +152,31 @@ def cmd_gpu(_args):
     vendor = gpu_vendor()
     print(f"gpu {vendor}")
     print(f"recommended {RECOMMENDED.get(vendor, 'cpu')}")
+    return 0
+
+
+def cmd_plan(_args):
+    """Лучшая локальная конфигурация для этого железа (читает автонастройка)."""
+    vendor = gpu_vendor()
+    vram = vram_gb(vendor)
+    cpu, threads, ram = cpu_info()
+    accel = RECOMMENDED.get(vendor, "cpu")
+    fallback = cpu_model(threads, ram)
+    if accel == "cpu":
+        model = fallback
+    else:
+        # Полная turbo — от 3 ГБ видеопамяти; встроенной графике хватит q5.
+        model = "ggml-large-v3-turbo.bin" if vram >= 3 else "ggml-large-v3-turbo-q5_0.bin"
+    print(f"gpu {vendor}")
+    print(f"gpu_name {gpu_name() or '-'}")
+    print(f"vram {vram:.1f}")
+    print(f"cpu {cpu or '-'}")
+    print(f"threads {threads}")
+    print(f"ram {ram:.0f}")
+    print(f"accel {accel}")
+    print(f"model {model}")
+    print(f"cpu_model {fallback}")
+    print(f"stt {STT_BEST}")
     return 0
 
 
@@ -196,6 +282,28 @@ def price_per_minute(pricing):
     return f"${per_min:.4f}/мин" if 0 < per_min < 1 else ""
 
 
+def pick_stt(data):
+    """Лучшая модель распознавания из списка OpenRouter — выбирает программа сама."""
+    if not data:
+        return STT_BEST
+    ids = {m["id"] for m in data}
+    for model in STT_PREFERRED:
+        if model in ids:
+            return model
+    # Нет знакомых — берём самую дешёвую по цене за секунду аудио.
+    priced = []
+    for m in data:
+        try:
+            price = float((m.get("pricing") or {}).get("prompt") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            priced.append((price, m["id"]))
+    if priced:
+        return min(priced)[1]
+    return sorted(ids)[0] if ids else STT_BEST
+
+
 def cmd_stt_models(args):
     data = None
     fresh = os.path.isfile(STT_CACHE) and time.time() - os.path.getmtime(STT_CACHE) < 86400
@@ -218,6 +326,9 @@ def cmd_stt_models(args):
         for model in STT_FALLBACK:
             print(f"{model}\t{model}\t")
         return 0
+    if args.best:
+        print(pick_stt(data))
+        return 0
     for m in sorted(data, key=lambda m: m["id"]):
         print(f"{m['id']}\t{m.get('name') or m['id']}\t{price_per_minute(m.get('pricing') or {})}")
     return 0
@@ -227,6 +338,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("gpu")
+    sub.add_parser("plan")
     accel = sub.add_parser("accel").add_subparsers(dest="action", required=True)
     accel.add_parser("status")
     accel.add_parser("install").add_argument("name", choices=sorted(ACCELS))
@@ -239,9 +351,11 @@ def main():
     ollama.add_parser("status")
     ollama.add_parser("install").add_argument("name", choices=sorted(OLLAMA_VARIANTS))
     ollama.add_parser("pull").add_argument("name")
-    sub.add_parser("stt-models").add_argument("--refresh", action="store_true")
+    stt = sub.add_parser("stt-models")
+    stt.add_argument("--refresh", action="store_true")
+    stt.add_argument("--best", action="store_true", help="лучшая модель распознавания для автонастройки")
     args = parser.parse_args()
-    handlers = {"gpu": cmd_gpu, "accel": cmd_accel, "whisper": cmd_whisper,
+    handlers = {"gpu": cmd_gpu, "plan": cmd_plan, "accel": cmd_accel, "whisper": cmd_whisper,
                 "ollama": cmd_ollama, "stt-models": cmd_stt_models}
     return handlers[args.cmd](args)
 

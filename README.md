@@ -59,6 +59,9 @@ git clone https://github.com/PHONE1X/nata && cd nata/packaging/nata && makepkg -
 
 Окно настройки (`whisper-dictate-gui`) — основной способ. Все разделы в одном окне:
 
+- **Автонастройка** — кнопка в шапке окна, работает с любой страницы. Nata определяет видеокарту, видеопамять, процессор и ОЗУ и спрашивает одно: локально или в облаке. Локально — ставит нужный ускоритель, качает подходящую модель whisper, VAD и OPUS-MT (если ключ DeepL или Gemini уже сохранён, перевод не трогаем). В облаке — спрашивает ключи OpenRouter и DeepL/Gemini, модель распознавания выбирает сама из живого списка OpenRouter, локальную модель качает про запас. То же из терминала: `whisper-dictate-setup auto local` или `auto cloud deepl|gemini|local`.
+- **Последний запуск** (на страницах «Автонастройка» и «Распознавание»): где на самом деле распознавали — в облаке или на этом компьютере, почему облако отказалось (например, не хватает $0.50 на балансе) и сколько заняло. Там же — остаток баланса OpenRouter. Из терминала: `whisper-dictate-setup last`.
+
 - **Распознавание**: облако OpenRouter (выпадающий список всех моделей распознавания с ценой за минуту, или любая модель вручную) либо локально. Ускоритель: Авто / Vulkan / ROCm / CUDA / процессор; недостающий пакет (`ggml-vulkan`, `ggml-hip`, `ggml-cuda`) ставится кнопкой через окно пароля (pkexec). Модели whisper и VAD скачиваются кнопкой «Скачать» в выбранную папку.
 - **Перевод**: DeepL, Gemini или локально. Локально — OPUS-MT (ru↔en на процессоре, модели и движок скачиваются кнопкой) или Ollama (установка с нужным ускорителем, выбор и скачивание моделей).
 - **API-ключи**: OpenRouter, DeepL, Gemini. Поле скрытое, ключ уходит в libsecret (или в `secrets.env`, если libsecret недоступен).
@@ -77,6 +80,9 @@ whisper-dictate-setup whisper-models status|download ggml-large-v3-turbo.bin
 whisper-dictate-setup accel status|install vulkan|hip|cuda
 whisper-dictate-setup ollama status|install vulkan|rocm|cuda|cpu|pull NAME
 whisper-dictate-setup stt-models [--refresh]          # облачные модели OpenRouter
+whisper-dictate-setup stt-models --best               # модель, которую выбрала бы автонастройка
+whisper-dictate-setup keys --credits                  # остаток баланса OpenRouter
+whisper-dictate-setup last                            # что было в последнем задании
 whisper-dictate-setup bind apply --key "SUPER + U"    # Hyprland
 whisper-dictate-setup qs ii install                   # или: qs standalone install
 whisper-dictate-setup doctor [--fix]

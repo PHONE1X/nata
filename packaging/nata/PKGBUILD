@@ -3,7 +3,7 @@
 # Для AUR заменить _src на tarball релиза (source=(...) + sha256sums).
 pkgname=nata
 pkgver=0.1.0
-pkgrel=3
+pkgrel=4
 pkgdesc='Nata: voice dictation for Wayland (whisper.cpp, optional cloud STT and translation, GTK setup, Quickshell widget)'
 arch=(any)
 url='https://github.com/PHONE1X/nata'

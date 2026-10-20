@@ -10,6 +10,8 @@ set -gx HOME $T/home
 mkdir -p $HOME $T/run $T/etc $T/hypr/custom
 set -gx XDG_CONFIG_HOME $HOME/.config
 set -gx XDG_STATE_HOME $HOME/.local/state
+set -gx XDG_CACHE_HOME $HOME/.cache
+set -gx XDG_DATA_HOME $HOME/.local/share
 set -gx XDG_RUNTIME_DIR $T/run
 set -gx STUB_SECRET_DIR $T/sec
 set -gx STUB_NOTIFY_LOG $T/notify.log
@@ -202,6 +204,65 @@ touch $T/ggml/libggml-hip.so
 check "accel: hip найден" string match -q 'hip ok*' -- (env WD_GGML_DIR=$T/ggml $S accel status)
 check "accel: vulkan нет" string match -q 'vulkan missing*' -- (env WD_GGML_DIR=$T/ggml $S accel status)
 check "accel: установка через WD_PKEXEC" env WD_PKEXEC=true $S accel install vulkan
+
+echo "== автонастройка"
+check "plan: есть ускоритель и модель" string match -qr '^model ggml-' -- ($S plan)
+check "auto: неверный режим" not $S auto bogus
+check "auto cloud: без ключа OpenRouter — отказ" not $S auto cloud deepl
+check "auto cloud: неверный переводчик" not $S auto cloud yandex
+
+echo "== последний запуск"
+mkdir -p $HOME/.local/state/dictate
+printf '%s\n' \
+    '2026-10-20 23:52:36 JOB 002048 start: lang=ru target=0x1 "kitty"' \
+    '2026-10-20 23:52:37   cloud chunk 1/1 failed (http=402 curl=0 0.9s This request requires at least $0.50 in balance for audio) — local whisper' \
+    '2026-10-20 23:52:39 JOB 002048 TIMING: audio 68s | whisper 3.19s (21.3x realtime) | translate 0.01s | total 3.19s | stt local(cloud failed) | lang ru' \
+    >$HOME/.local/state/dictate/dictate.log
+set -l lastout ($S last)
+check "last: где распознавали" string match -q '*stt*local(cloud failed)*' -- "$lastout"
+check "last: причина отказа облака" string match -q '*http=402: This request requires*' -- "$lastout"
+check "last: время распознавания" string match -q '*whisper*3.19*' -- "$lastout"
+check "last: понятная строка" string match -q '*Последний раз: на этом компьютере*' -- "$lastout"
+check "last: пустой журнал" string match -q '*empty*' -- ($S last --log $T/nolog)
+
+echo "== облачная модель выбирается сама"
+mkdir -p $HOME/.cache/whisper-dictate
+printf '%s\n' \
+    '[{"id":"foo/cheap","name":"Cheap","pricing":{"prompt":"0.000001","completion":"0"}},' \
+    ' {"id":"bar/pricey","name":"Pricey","pricing":{"prompt":"0.0005","completion":"0"}},' \
+    ' {"id":"openai/gpt-4o-transcribe","name":"OpenAI","pricing":{"prompt":"0.0000025","completion":"0.00001"}}]' \
+    >$HOME/.cache/whisper-dictate/stt-models.json
+check "stt: знакомая модель" string match -q 'openai/gpt-4o-transcribe' -- ($S stt-models --best)
+printf '%s\n' \
+    '[{"id":"foo/cheap","name":"Cheap","pricing":{"prompt":"0.000001","completion":"0"}},' \
+    ' {"id":"bar/pricey","name":"Pricey","pricing":{"prompt":"0.0005","completion":"0"}}]' \
+    >$HOME/.cache/whisper-dictate/stt-models.json
+check "stt: нет знакомых — самая дешёвая" string match -q 'foo/cheap' -- ($S stt-models --best)
+
+echo "== автонастройка: всё на этом компьютере"
+set -l mdir $T/wmodels
+$S conf MODEL_DIR $mdir >/dev/null
+# Модель ищется в MODEL_DIR, а не в DICTATE_MODEL_DIR из прошлых тестов.
+set -gx DICTATE_MODEL_DIR $mdir
+set -e DICTATE_STT
+mkdir -p $mdir
+# Модели нужного размера (файлы-дырки, места не занимают) — скачивать не придётся.
+for line in ($S whisper-models status)
+    set -l parts (string split ' ' -- $line)
+    test "$parts[1]" = dir; and continue
+    test "$parts[2]" = ok; and continue
+    truncate -s $parts[3] $mdir/$parts[1]
+end
+mkdir -p $T/ggml
+touch $T/ggml/libggml-vulkan.so $T/ggml/libggml-cuda.so $T/ggml/libggml-hip.so
+env WD_GGML_DIR=$T/ggml WD_PKEXEC=true WD_HF_BASE_URL=file://$T/hf WD_MT_BASE_URL=file://$T/hf \
+    $S auto local >$T/auto.out 2>&1
+check "auto local: отработал без ошибки" test $status -eq 0
+check "auto local: ускоритель записан" string match -q 'WHISPER_BACKEND=*' -- (cat $HOME/.config/whisper-dictate/dictate.conf)
+check "auto local: модель записана" string match -q 'MODEL=ggml-*' -- (cat $HOME/.config/whisper-dictate/dictate.conf)
+check "auto local: распознавание локально" string match -q 'local' -- ($S keys --get dictationStt)
+check "auto local: перевод локально" string match -q 'local' -- ($S keys --get dictationProvider)
+check "auto local: локальная модель для перевода" string match -q 'marian:opus-tc-big' -- ($S keys --get dictationLocalModel)
 
 echo
 echo "итого: ok=$pass fail=$failn  (песочница $T)"

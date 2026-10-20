@@ -130,12 +130,36 @@ class Settings(Gtk.ApplicationWindow):
         split.append(content)
         self.set_child(split)
 
+        # Кнопка в шапке: с неё начинается настройка в одно нажатие.
+        header = Gtk.HeaderBar()
+        header.set_title_widget(Gtk.Label(label="Nata"))
+        self.auto_button = Gtk.Button(label="Автонастройка")
+        self.auto_button.set_tooltip_text("Nata сама подберёт ускоритель и модели под ваш компьютер")
+        self.auto_button.add_css_class("suggested-action")
+        self.auto_button.connect("clicked", self.auto_start)
+        header.pack_end(self.auto_button)
+        self.set_titlebar(header)
+
+        self.build_pages()
+
+    def build_pages(self):
+        self.add_page("auto", "Автонастройка", self.auto_page())
         self.add_page("recognition", "Распознавание", self.recognition_page())
         self.add_page("translation", "Перевод", self.translation_page())
         self.add_page("keys", "API-ключи", self.keys_page())
         self.add_page("hotkey", "Горячая клавиша", self.hotkey_page())
         self.add_page("integrations", "Quickshell", self.integrations_page())
         self.add_page("checks", "Проверка", self.checks_page())
+
+    def reload_pages(self):
+        """После автонастройки страницы строятся заново, чтобы показать новые значения."""
+        visible = self.stack.get_visible_child_name()
+        self.conf = read_conf()
+        while (child := self.stack.get_first_child()) is not None:
+            self.stack.remove(child)
+        self.build_pages()
+        if visible:
+            self.stack.set_visible_child_name(visible)
 
     def add_page(self, name, title, child):
         self.stack.add_titled(scrolled(child), name, title)
@@ -266,12 +290,182 @@ class Settings(Gtk.ApplicationWindow):
         entry.connect("activate", lambda _e: on_chosen())
         return entry, row(entry, browse)
 
+    # ───────────────────────── быстрая настройка ──────────────────────────
+
+    def auto_page(self):
+        page = box(10)
+        page.append(heading("Автонастройка"))
+        page.append(hint("Одно нажатие — и Nata сама выбирает самый быстрый вариант под ваше железо: "
+                         "ускоритель, модель распознавания, перевод. Нужные пакеты ставятся, модели "
+                         "скачиваются. Дальше всё можно поменять вручную на остальных страницах."))
+        rc, out = setup("plan")
+        plan = dict(line.split(" ", 1) for line in out.splitlines() if " " in line) if rc == 0 else {}
+        if plan:
+            gpu = plan.get("gpu_name", "-")
+            gpu = "не найдена" if gpu == "-" else f"{gpu}, {plan.get('vram')} ГБ"
+            accel = ACCEL_TITLES.get(plan.get("accel"), plan.get("accel"))
+            model = dict(WHISPER_CHOICES).get(plan.get("model"), plan.get("model", "")).split(" — ")[0]
+            page.append(hint(f"Видеокарта: {gpu}\nПроцессор: {plan.get('cpu')}, потоков {plan.get('threads')}, "
+                             f"ОЗУ {plan.get('ram')} ГБ\n\nДля этого компьютера: распознавание на «{accel}», "
+                             f"модель whisper {model}."))
+        page.append(self.last_run_box())
+        button = Gtk.Button(label="Настроить автоматически", halign=Gtk.Align.START, margin_top=8)
+        button.add_css_class("suggested-action")
+        button.connect("clicked", self.auto_start)
+        page.append(button)
+        return page
+
+    # ─────────────────── что было в последнем запуске ─────────────────────
+
+    def last_run_box(self):
+        title = Gtk.Label(xalign=0)
+        title.set_markup("<b>Последний запуск</b>")
+        label = Gtk.Label(xalign=0, wrap=True, hexpand=True)
+        refresh = Gtk.Button(label="Обновить", valign=Gtk.Align.START)
+        refresh.connect("clicked", lambda _b: self.refresh_last(label))
+        frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        frame.append(title)
+        frame.append(row(label, refresh))
+        self.refresh_last(label)
+        return frame
+
+    def refresh_last(self, label):
+        rc, out = setup("last")
+        fields = dict(line.split("\t", 1) for line in out.splitlines() if "\t" in line)
+        if rc != 0 or fields.get("empty") == "1" or not fields.get("text"):
+            label.set_text("Диктовка ещё не запускалась.")
+            return
+        label.set_text(fields["text"])
+        details = [f"{fields.get('when', '')}"]
+        if fields.get("lang"):
+            details.append(f"язык {fields['lang']}")
+        if fields.get("stt"):
+            details.append(fields["stt"])
+        label.set_tooltip_text(" · ".join(details))
+        if fields.get("reason"):
+            label.add_css_class("warning")
+
+    def auto_start(self, _button):
+        dialog = Gtk.AlertDialog(message="Где распознавать и переводить?",
+                                 detail="На этом компьютере — бесплатно и без интернета, всё скачается само.\n"
+                                        "В облаке — нужны ключи (OpenRouter с балансом от $0.50, DeepL или Gemini); "
+                                        "локальная модель всё равно скачается про запас.",
+                                 buttons=["Отмена", "В облаке", "На этом компьютере"],
+                                 cancel_button=0, default_button=2)
+
+        def done(dlg, result):
+            try:
+                choice = dlg.choose_finish(result)
+            except GLib.Error:
+                return
+            if choice == 2:
+                self.run_job(["auto", "local"], self.auto_done)
+            elif choice == 1:
+                self.auto_cloud_form()
+
+        dialog.choose(self, None, done)
+
+    def auto_cloud_form(self):
+        saved = saved_key_names()
+        win = Gtk.Window(title="Облачная настройка", transient_for=self, modal=True, default_width=520)
+        page = box(10)
+        page.append(heading("Распознавание: OpenRouter"))
+        rc, out = setup("stt-models", "--best")
+        best = out.strip().splitlines()[0] if rc == 0 and out.strip() else STT_CLOUD_DEFAULT
+        page.append(hint(f"Модель выбирается сама: {best}. На балансе OpenRouter нужно от $0.50."))
+        balance = Gtk.Label(xalign=0, wrap=True)
+        rc, out = setup("keys", "--credits")
+        if rc == 0:
+            credits = dict(line.split("\t", 1) for line in out.splitlines() if "\t" in line)
+            left = (credits.get("remaining") or "0").replace(",", ".")
+            try:
+                low = float(left) < 0.5
+            except ValueError:
+                low = False
+            balance.set_text(f"Баланс OpenRouter: ${left}." + (" Мало: облако не ответит, пока не будет $0.50."
+                                                             if low else ""))
+            if low:
+                balance.add_css_class("warning")
+        else:
+            balance.set_text("Баланс OpenRouter проверить не удалось.")
+            balance.add_css_class("dim-label")
+        page.append(balance)
+        openrouter = Gtk.PasswordEntry(show_peek_icon=True, hexpand=True)
+        openrouter.set_property("placeholder-text", "сохранён — можно не вводить" if "openrouter" in saved
+                                else "ключ OpenRouter")
+        page.append(row(Gtk.Label(label="Ключ OpenRouter", xalign=0, width_chars=16), openrouter))
+        page.append(heading("Перевод"))
+        choices = [("deepl", "DeepL"), ("gemini", "Google Gemini"), ("local", "Локально (OPUS-MT, без ключа)")]
+        buttons, group = [], None
+        for value, label in choices:
+            radio = Gtk.CheckButton(label=label, group=group, active=value == "deepl")
+            group = group or radio
+            buttons.append((value, radio))
+            page.append(radio)
+        key_label = Gtk.Label(xalign=0, width_chars=16)
+        key = Gtk.PasswordEntry(show_peek_icon=True, hexpand=True)
+        key_row = row(key_label, key)
+        page.append(key_row)
+        error = Gtk.Label(xalign=0, wrap=True)
+        error.add_css_class("error")
+
+        def provider():
+            return next(value for value, radio in buttons if radio.get_active())
+
+        def update(*_args):
+            prov = provider()
+            key_row.set_visible(prov != "local")
+            key_label.set_text(f"Ключ {dict(choices)[prov]}" if prov != "local" else "")
+            key.set_text("")
+            error.set_text("")
+            key.set_property("placeholder-text", "сохранён — можно не вводить" if prov in saved
+                             else f"ключ {dict(choices)[prov]}")
+
+        for _value, radio in buttons:
+            radio.connect("toggled", update)
+        update()
+        page.append(error)
+
+        def confirm(_b):
+            prov = provider()
+            entered = {"openrouter": openrouter.get_text().strip()}
+            if prov != "local":
+                entered[prov] = key.get_text().strip()
+            missing = [slot for slot, value in entered.items() if not value and slot not in saved]
+            if missing:
+                error.set_text("Нужен ключ: " + ", ".join(missing))
+                return
+            for slot, value in entered.items():
+                if value:
+                    rc, out = setup("key", slot, stdin=value)
+                    if rc:
+                        error.set_text(f"Не удалось сохранить ключ {slot}: {out}")
+                        return
+            win.close()
+            self.run_job(["auto", "cloud", prov], self.auto_done)
+
+        cancel = Gtk.Button(label="Отмена")
+        cancel.connect("clicked", lambda _b: win.close())
+        go = Gtk.Button(label="Настроить")
+        go.add_css_class("suggested-action")
+        go.connect("clicked", confirm)
+        page.append(row(Gtk.Box(hexpand=True), cancel, go))
+        win.set_child(page)
+        win.present()
+
+    def auto_done(self, ok):
+        message = self.status.get_text()
+        self.reload_pages()
+        self.say(message if ok else message + " Подробности — на странице «Проверка».")
+
     # ─────────────────────────── распознавание ────────────────────────────
 
     def recognition_page(self):
         page = box(10)
         stt = effective(self.conf, "STT", "dictationStt") or STT_CLOUD_DEFAULT_FULL
         cloud = stt.startswith("openrouter:")
+
+        page.append(self.last_run_box())
 
         page.append(heading("Где распознавать речь"))
         self.stt_cloud = Gtk.CheckButton(label="В облаке (OpenRouter) — нужен ключ и баланс от $0.50", active=cloud)
@@ -688,7 +882,8 @@ class Settings(Gtk.ApplicationWindow):
 
 class Application(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="io.github.phone1x.Nata",
+        # NATA_APP_ID — запуск второй копии (для проверки), не задевает основную.
+        super().__init__(application_id=os.environ.get("NATA_APP_ID") or "io.github.phone1x.Nata",
                          flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
 
     def do_activate(self):

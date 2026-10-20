@@ -14,6 +14,7 @@ set -g WD_BIND_PY $WD_LIBDIR/hypr-bind.py
 set -g WD_QS_PY $WD_LIBDIR/qs-integrate.py
 set -g WD_MT_PY $WD_LIBDIR/mt-models.py
 set -g WD_ENGINES_PY $WD_LIBDIR/engines.py
+set -g WD_LAST_PY $WD_LIBDIR/lastrun.py
 source $WD_LIBDIR/wm.fish
 
 # ───────────────────────────── конфиг и секреты ────────────────────────────
@@ -160,6 +161,12 @@ function wd_engines
     python3 $WD_ENGINES_PY $argv
 end
 
+# Что было в последнем задании: где распознавали, сколько заняло, почему облако отказало.
+function wd_last
+    set -l log (wd_conf LOG_FILE ~/.local/state/dictate/dictate.log)
+    python3 $WD_LAST_PY --log (string replace -r '^~' $HOME -- $log) $argv
+end
+
 # GPU-бэкенд, на котором будет считать whisper: выбранный в WHISPER_BACKEND
 # (vulkan|hip|cuda|cpu) или, при auto, первый установленный пакет ggml-<имя>.
 function wd_gpu_backend
@@ -176,6 +183,109 @@ function wd_gpu_backend
 end
 
 # ─────────────────────────────── Hyprland ──────────────────────────────────
+
+# ───────────────────────────── автонастройка ───────────────────────────────
+# wd_auto local                    — всё на этом компьютере, лучшее для железа
+# wd_auto cloud deepl|gemini|local — распознавание в OpenRouter, перевод выбранным
+# Ключи сохраняются заранее (GUI или «key»); здесь только проверка, что они есть.
+
+function wd_plan_get --argument-names key
+    string replace -rf "^$key " '' -- $WD_PLAN
+end
+
+function wd_auto --argument-names mode provider
+    if test "$mode" = local
+        set provider local
+    else if test "$mode" != cloud; or not contains -- "$provider" deepl gemini local
+        echo "Использование: auto local | auto cloud deepl|gemini|local" >&2
+        return 2
+    end
+    set -l have (wd_key_effective openrouter)
+    if test "$mode" = cloud; and test -z "$have"
+        echo "Нет ключа OpenRouter — облачное распознавание без него не работает." >&2
+        return 1
+    end
+    set have (wd_key_effective $provider)
+    if contains -- $provider deepl gemini; and test -z "$have"
+        echo "Нет ключа $provider для перевода." >&2
+        return 1
+    end
+
+    # Локальный режим не должен ломать привычный перевод: если ключ DeepL или
+    # Gemini уже сохранён, оставляем тот провайдер, который человек уже выбрал.
+    set -l provider_keep ""
+    if test "$mode" = local
+        set -l cur (wd_key_get dictationProvider)
+        if contains -- "$cur" deepl gemini; and test -n (wd_key_effective $cur)
+            set provider_keep $cur
+        end
+    end
+
+    set -g WD_PLAN (wd_engines plan)
+    set -l accel (wd_plan_get accel)
+    set -l model (wd_plan_get model)
+    set -l gpu (wd_plan_get gpu_name)
+    test "$gpu" = -; and set gpu "не найдена"
+    echo "Видеокарта: $gpu, "(wd_plan_get vram)" ГБ. Процессор: "(wd_plan_get cpu)", потоков "(wd_plan_get threads)", ОЗУ "(wd_plan_get ram)" ГБ."
+    set -l warns 0
+
+    if test "$accel" != cpu
+        if not string match -q "$accel ok*" -- (wd_engines accel status)
+            echo "Шаг 1: ставлю ускоритель $accel (спросит пароль)…"
+            if not wd_engines accel install $accel
+                echo "Ускоритель не установлен — whisper будет считать на процессоре."
+                set accel auto
+                set model (wd_plan_get cpu_model)
+                set warns (math $warns + 1)
+            end
+        end
+    end
+    wd_conf_set WHISPER_BACKEND $accel; or return 1
+    wd_conf_set MODEL $model; or return 1
+    echo "Ускоритель: $accel. Модель whisper: $model."
+
+    set -l mdir (string replace -r '^~' $HOME -- (wd_model_dir))
+    test "$mode" = cloud; and echo "Локальная модель нужна и в облачном режиме: на неё уходит кусок, если облако не ответило."
+    for name in $model ggml-silero-v5.1.2.bin
+        echo "Шаг 2: модель $name…"
+        wd_engines whisper --dir $mdir download $name; or return 1
+    end
+
+    if test "$provider" = local
+        if test -n "$provider_keep"
+            echo "Перевод оставляю: $provider_keep — ключ уже сохранён."
+            set provider $provider_keep
+        else
+            for step in "download zle-en" "download en-zle" engine
+                echo "Шаг 3: перевод OPUS-MT, $step…"
+                if not wd_mt (string split ' ' -- $step)
+                    echo "Не удалось: $step. Локальный перевод можно доустановить на странице «Перевод»."
+                    set warns (math $warns + 1)
+                end
+            end
+            printf '%s' marian:opus-tc-big | wd_key_store dictationLocalModel >/dev/null; or return 1
+        end
+    end
+
+    set -l stt local
+    if test "$mode" = cloud
+        # Модель выбирает сама программа: берёт лучшую из списка OpenRouter.
+        set -l cloud_model (wd_engines stt-models --best)
+        test -z "$cloud_model"; and set cloud_model (wd_plan_get stt)
+        set stt openrouter:$cloud_model
+    end
+    printf '%s' $stt | wd_key_store dictationStt >/dev/null; or return 1
+    printf '%s' $provider | wd_key_store dictationProvider >/dev/null; or return 1
+    # Старые значения в конфиге перекрыли бы выбранное.
+    wd_conf_set STT ""
+    wd_conf_set TRANSLATE_PROVIDER ""
+    echo "Распознавание: $stt. Перевод: $provider."
+    if test $warns -gt 0
+        echo "Настроено, предупреждений: $warns — см. выше."
+    else
+        echo "Всё настроено."
+    end
+end
 
 function wd_bind
     python3 $WD_BIND_PY $argv
@@ -351,6 +461,25 @@ switch "$cmd"
         set -l name $argv[2]
         test -n "$name"; or begin; echo "Использование: keys --get NAME" >&2; return 1; end
         wd_key_get $name
+
+    case --credits
+        # Остаток баланса OpenRouter: облачное распознавание требует минимум $0.50.
+        set -l key (wd_key_effective openrouter)
+        if test -z "$key"
+            echo "Ключ openrouter не найден в кейринге."
+            return 1
+        end
+        set -l resp (curl -s --max-time 15 -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/credits)
+        set -l total (printf '%s' "$resp" | jq -r '.data.total_credits // empty' 2>/dev/null)
+        if test -z "$total"
+            echo "OpenRouter не ответил: "(printf '%s' "$resp" | head -c 200)
+            return 1
+        end
+        set -l used (printf '%s' "$resp" | jq -r '.data.total_usage // 0')
+        set -l left (math $total - $used)
+        LC_ALL=C printf 'remaining\t%.4f\n' $left
+        printf 'total\t%s\n' $total
+        printf 'used\t%s\n' $used
 
     case --list-models
         set -l name $argv[2]

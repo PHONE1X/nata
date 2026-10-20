@@ -16,7 +16,9 @@
 #   whisper-dictate-setup whisper-models status|download NAME   модели whisper и VAD
 #   whisper-dictate-setup accel status|install vulkan|hip|cuda   ускоритель whisper
 #   whisper-dictate-setup ollama status|install VARIANT|pull NAME
-#   whisper-dictate-setup gpu | stt-models [--refresh]
+#   whisper-dictate-setup gpu | plan | stt-models [--refresh]
+#   whisper-dictate-setup auto local | auto cloud deepl|gemini|local   автонастройка
+#   whisper-dictate-setup last                    что было в последнем задании
 #
 # Секреты читаются только со stdin / скрытым вводом, в argv не передаются.
 
@@ -102,7 +104,13 @@ switch "$args[1]"
     case mt
         wd_mt $args[2..-1]
         exit $status
-    case gpu accel ollama stt-models
+    case auto
+        wd_auto $args[2..-1]
+        exit $status
+    case last
+        wd_last $args[2..-1]
+        exit $status
+    case gpu plan accel ollama stt-models
         wd_engines $args
         exit $status
     case whisper-models
