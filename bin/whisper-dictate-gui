@@ -19,7 +19,7 @@ KEY_SLOTS = [
     ("deepl", "DeepL", "перевод"),
     ("gemini", "Google Gemini", "перевод"),
 ]
-TRANSLATE_CHOICES = [("", "Выключен"), ("gemini", "Google Gemini"), ("deepl", "DeepL"), ("local", "Локальный скрипт")]
+TRANSLATE_CHOICES = [("gemini", "Google Gemini"), ("deepl", "DeepL"), ("local", "Локальный перевод (Ollama / Marian)")]
 QS_TARGETS = [
     ("standalone", "Отдельный виджет", "Самостоятельный индикатор. Запуск: qs -c whisper-dictate"),
     ("ii", "Logical Impulse (ii)", "Кнопка в баре и пункт «Диктовка» в настройках. После установки перезапустите Quickshell."),
@@ -49,6 +49,25 @@ def saved_key_names():
     if rc != 0:
         return set()
     return {line.strip() for line in out.splitlines()[1:] if line.strip()}
+
+
+def stored(name):
+    rc, out = setup("keys", "--get", name)
+    return out if rc == 0 else ""
+
+
+# Значение, которое реально использует диктовка: dictate.conf перекрывает связку ключей.
+def effective(conf, conf_key, slot):
+    return conf.get(conf_key) or stored(slot)
+
+
+# Как в bin/whisper-dictate: имя без «/» ищется в MODEL_DIR.
+def model_path(conf, key, default_name):
+    name = conf.get(key) or default_name
+    if "/" in name:
+        return name
+    model_dir = conf.get("MODEL_DIR") or "~/.local/share/whisper-dictate/models"
+    return os.path.join(os.path.expanduser(model_dir), name)
 
 
 def box(spacing=8):
@@ -120,6 +139,17 @@ class Settings(Gtk.ApplicationWindow):
         self.say(f"Сохранено: {key}")
         return True
 
+    def save_setting(self, conf_key, slot, value):
+        rc, out = setup("key", slot, stdin=value)
+        if rc:
+            self.say(f"Ошибка записи {slot}: {out}")
+            return False
+        if self.conf.get(conf_key):
+            setup("conf", conf_key, "")
+            self.conf[conf_key] = ""
+        self.say(f"Сохранено: {slot}")
+        return True
+
     def choose_file(self, entry):
         dialog = Gtk.FileDialog(title="Выберите файл")
 
@@ -139,7 +169,7 @@ class Settings(Gtk.ApplicationWindow):
 
     def recognition_page(self):
         page = box(10)
-        stt = self.conf.get("STT", "local")
+        stt = effective(self.conf, "STT", "dictationStt") or "local"
         cloud = stt.startswith("openrouter:")
 
         self.stt_local = Gtk.CheckButton(label="Только локально (whisper.cpp)", active=not cloud)
@@ -149,8 +179,10 @@ class Settings(Gtk.ApplicationWindow):
         save_stt = Gtk.Button(label="Сохранить распознавание", halign=Gtk.Align.START)
         save_stt.connect("clicked", self.save_stt)
 
-        self.model_entry, model_row = self.file_row(self.conf.get("MODEL", ""), "/путь/к/ggml-medium.bin")
-        self.vad_entry, vad_row = self.file_row(self.conf.get("VAD_MODEL", ""), "/путь/к/silero-vad.onnx")
+        self.model_entry, model_row = self.file_row(model_path(self.conf, "MODEL", "ggml-large-v3-turbo.bin"),
+                                                    "/путь/к/ggml-medium.bin")
+        self.vad_entry, vad_row = self.file_row(model_path(self.conf, "VAD_MODEL", "ggml-silero-v5.1.2.bin"),
+                                                "/путь/к/silero-vad.onnx")
         save_models = Gtk.Button(label="Сохранить пути к моделям", halign=Gtk.Align.START)
         save_models.connect("clicked", self.save_models)
 
@@ -170,9 +202,9 @@ class Settings(Gtk.ApplicationWindow):
     def save_stt(self, _button):
         if self.stt_cloud.get_active():
             model = self.stt_model.get_text().strip() or STT_CLOUD_DEFAULT
-            self.write_conf("STT", f"openrouter:{model}")
+            self.save_setting("STT", "dictationStt", f"openrouter:{model}")
         else:
-            self.write_conf("STT", "local")
+            self.save_setting("STT", "dictationStt", "local")
 
     def save_models(self, _button):
         for key, entry in (("MODEL", self.model_entry), ("VAD_MODEL", self.vad_entry)):
@@ -182,11 +214,11 @@ class Settings(Gtk.ApplicationWindow):
 
     def translation_page(self):
         page = box(10)
-        current = self.conf.get("TRANSLATE_PROVIDER", "")
+        current = effective(self.conf, "TRANSLATE_PROVIDER", "dictationProvider") or "gemini"
         self.translate_buttons = []
         group = None
         page.append(heading("Провайдер перевода"))
-        page.append(hint("Перевод нужен, когда раскладка не русская."))
+        page.append(hint("Перевод нужен, когда раскладка не русская. Пустой выбор диктовка понимает как Google Gemini."))
         for value, label in TRANSLATE_CHOICES:
             button = Gtk.CheckButton(label=label, group=group, active=value == current)
             if group is None:
@@ -194,25 +226,35 @@ class Settings(Gtk.ApplicationWindow):
             self.translate_buttons.append((value, button))
             page.append(button)
 
-        self.gemini_model = Gtk.Entry(text=self.conf.get("GEMINI_MODEL", ""), hexpand=True,
-                                      placeholder_text="пусто — модель по умолчанию")
-        self.translate_script, script_row = self.file_row(self.conf.get("TRANSLATE_SCRIPT", ""),
-                                                         "/путь/к/local-translate.sh")
+        self.gemini_model = Gtk.Entry(text=effective(self.conf, "GEMINI_MODEL", "geminiDictationModel"),
+                                      hexpand=True, placeholder_text="__auto__ — выбрать модель автоматически")
+        self.local_model = Gtk.Entry(text=stored("dictationLocalModel"), hexpand=True,
+                                     placeholder_text="marian:<каталог> или ollama:<модель>")
+        self.translate_script, script_row = self.file_row(
+            self.conf.get("TRANSLATE_SCRIPT") or os.path.expanduser("~/.config/quickshell/ii/scripts/ai/local-translate.sh"),
+            "/путь/к/local-translate.sh")
         save = Gtk.Button(label="Сохранить перевод", halign=Gtk.Align.START)
         save.connect("clicked", self.save_translate)
 
         page.append(row(Gtk.Label(label="Модель Gemini", xalign=0, width_chars=16), self.gemini_model))
+        page.append(row(Gtk.Label(label="Локальная модель", xalign=0, width_chars=16), self.local_model))
+        page.append(hint("Локальная модель нужна для провайдера «Локальный перевод». Пусто — берётся общая модель локального перевода из Quickshell."))
         page.append(row(Gtk.Label(label="Скрипт локального перевода", xalign=0, width_chars=16), script_row))
         page.append(save)
         return page
 
     def save_translate(self, _button):
         chosen = next(value for value, button in self.translate_buttons if button.get_active())
-        self.write_conf("TRANSLATE_PROVIDER", chosen)
-        for key, entry in (("GEMINI_MODEL", self.gemini_model), ("TRANSLATE_SCRIPT", self.translate_script)):
-            value = entry.get_text().strip()
-            if value:
-                self.write_conf(key, value)
+        self.save_setting("TRANSLATE_PROVIDER", "dictationProvider", chosen)
+        gemini = self.gemini_model.get_text().strip()
+        if gemini:
+            self.save_setting("GEMINI_MODEL", "geminiDictationModel", gemini)
+        local = self.local_model.get_text().strip()
+        if local:
+            self.save_setting("", "dictationLocalModel", local)
+        script = self.translate_script.get_text().strip()
+        if script:
+            self.write_conf("TRANSLATE_SCRIPT", script)
 
     def keys_page(self):
         page = box(12)

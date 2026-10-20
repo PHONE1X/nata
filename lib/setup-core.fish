@@ -285,6 +285,12 @@ switch "$cmd"
         echo "Сохранённые имена ключей:"
         echo "$current" | jq -r '.apiKeys // {} | keys[]'
 
+    case --get
+        # Для несекретных слотов (провайдер, модели, STT), которые читает GUI.
+        set -l name $argv[2]
+        test -n "$name"; or begin; echo "Использование: keys --get NAME" >&2; return 1; end
+        wd_key_get $name
+
     case --list-models
         set -l name $argv[2]
         # Провайдер по умолчанию определяется по имени ключа (историческая
@@ -634,6 +640,7 @@ switch "$cmd"
             echo "Использование:"
             echo "  whisper-dictate-setup keys <name>                    — записать ключ (значение со stdin)"
             echo "  whisper-dictate-setup keys --list                    — список сохранённых имён"
+            echo "  whisper-dictate-setup keys --get <name>              — значение несекретного слота"
             echo "  whisper-dictate-setup keys --list-models <name> [--provider P] [--free-only] [--json]"
             echo "  whisper-dictate-setup keys --test-gemini <name> [model]"
             echo "  whisper-dictate-setup keys --test-openrouter <name>"
