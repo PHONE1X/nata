@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 
+LEGACY_APP = "illogical-impulse"
 DEFAULT_LABEL = "illogical-impulse Safe Storage"
 DEFAULT_EXPLANATION = "For storing API keys and other sensitive information"
 FIELD_RE = re.compile(r"^(label|created|modified|schema|attribute\.\S+) = ")
@@ -188,8 +189,8 @@ def locked_update(app, mutate):
     with open(lock_path(), "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         items = fetch(app)
-        merged = merge(items) if items else {"apiKeys": {}}
-        merged.setdefault("apiKeys", {})
+        seed = items or (fetch(LEGACY_APP) if app != LEGACY_APP else [])
+        merged = merge(seed)
         mutate(merged)
         label, attrs = canonical(app, items)
         r = store(label, attrs, json.dumps(merged, ensure_ascii=False))
@@ -201,7 +202,7 @@ def locked_update(app, mutate):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--app", default=os.environ.get("DICTATE_KEYRING_APP", "illogical-impulse"))
+    ap.add_argument("--app", default=os.environ.get("DICTATE_KEYRING_APP", "whisper-dictate"))
     sub = ap.add_subparsers(dest="cmd")
     d = sub.add_parser("doctor")
     d.add_argument("--fix", action="store_true")

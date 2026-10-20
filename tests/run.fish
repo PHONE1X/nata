@@ -34,7 +34,7 @@ function check --argument-names name
 end
 
 echo "== синтаксис"
-for f in $repo/bin/* $repo/lib/*.fish
+for f in $repo/bin/whisper-dictate $repo/bin/whisper-dictate-setup $repo/lib/*.fish
     check "fish -n "(basename $f) fish -n $f
 end
 for f in $repo/lib/*.py $repo/tests/stubs/secret-tool
@@ -67,14 +67,21 @@ check "10 параллельных записей — ни одна не пот�
 check "в репозитории нет ключей" not grep -rIE 'sk-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{30,}|sk-or-v1' $repo --exclude-dir=.git --exclude-dir=tests
 
 echo "== doctor: дубли в кейринге"
-echo '{"apiKeys":{"old1":"x1"}}' | secret-tool store --label=a application illogical-impulse
-echo '{"apiKeys":{"old2":"x2"}}' | secret-tool store --label=b application illogical-impulse explanation Foo
+echo '{"apiKeys":{"old1":"x1"}}' | secret-tool store --label=a application whisper-dictate
+echo '{"apiKeys":{"old2":"x2"}}' | secret-tool store --label=b application whisper-dictate explanation Foo
 $S doctor >/dev/null 2>&1
 check "doctor видит дубли (код 3)" test $status -eq 3
 $S doctor --fix --yes >/dev/null 2>&1
 check "--fix проходит" test $status -eq 0
-check "после --fix одна запись" test (secret-tool search --all application illogical-impulse | grep -c '^\[') -eq 1
-check "после --fix ключи слиты" test (secret-tool lookup application illogical-impulse | jq -r '.apiKeys | has("old1") and has("old2") and has("slot3")') = true
+check "после --fix одна запись" test (secret-tool search --all application whisper-dictate | grep -c '^\[') -eq 1
+check "после --fix ключи слиты" test (secret-tool lookup application whisper-dictate | jq -r '.apiKeys | has("old1") and has("old2") and has("slot3")') = true
+
+set -l seed_dir (mktemp -d)
+echo '{"apiKeys":{"legacy1":"L1"}}' | env STUB_SECRET_DIR=$seed_dir secret-tool store --label=l application illogical-impulse
+printf 'new' | env STUB_SECRET_DIR=$seed_dir fish $S key seeded >/dev/null 2>&1
+check "первая запись сохраняет ключи illogical-impulse" test (env STUB_SECRET_DIR=$seed_dir secret-tool lookup application whisper-dictate | jq -r '.apiKeys | has("legacy1") and has("seeded")') = true
+check "illogical-impulse не тронут" test (env STUB_SECRET_DIR=$seed_dir secret-tool lookup application illogical-impulse | jq -r '.apiKeys | has("seeded") | not') = true
+rm -rf $seed_dir
 check "резервная копия 0600" test (stat -c %a (ls $XDG_STATE_HOME/whisper-dictate/keyring-backup-*.json)[1]) = 600
 
 echo "== Hyprland: бинд"
@@ -138,6 +145,28 @@ timeout 60 $D --run-worker >/dev/null 2>&1
 check "сбой whisper: запись сохранена" test -e $T/rec2.wav
 check "сбой whisper: задание в failed/" test -e $cache/failed/000002.job
 set -e STUB_WHISPER_FAIL
+
+echo "== Quickshell: интеграция ii"
+set -l QS $T/qs
+mkdir -p $QS/ii/modules/common $QS/ii/modules/ii/bar
+printf 'import QtQuick\n\nItem {\n    property var pages: [\n    ]\n}\n' >$QS/ii/settings.qml
+printf 'Singleton {\n    property var states: QtObject {\n        property JsonObject ai: JsonObject {\n        }\n    }\n}\n' >$QS/ii/modules/common/Persistent.qml
+printf 'RowLayout {\n    id: indicatorsRowLayout\n    spacing: 0\n}\n' >$QS/ii/modules/ii/bar/BarContent.qml
+cp -r $QS/ii $T/qs-orig
+check "ii: до установки — не установлено" not python3 $repo/lib/qs-integrate.py ii status --dir $QS
+check "ii: установка" python3 $repo/lib/qs-integrate.py ii install --dir $QS
+check "ii: статус после установки" python3 $repo/lib/qs-integrate.py ii status --dir $QS
+python3 $repo/lib/qs-integrate.py ii install --dir $QS >/dev/null
+check "ii: повторная установка не дублирует" test (grep -c 'whisper-dictate >>>' $QS/ii/settings.qml) -eq 1
+check "ii: удаление" python3 $repo/lib/qs-integrate.py ii remove --dir $QS
+check "ii: после удаления файлы как до установки" diff -r $T/qs-orig $QS/ii
+check "ii: нет временных файлов" test (count (find $QS -name '*.wd-tmp')) -eq 0
+mkdir -p $QS/bad
+cp -r $T/qs-orig $QS/bad/ii
+printf 'RowLayout {\n    spacing: 0\n}\n' >$QS/bad/ii/modules/ii/bar/BarContent.qml
+cp -r $QS/bad/ii $T/bad-before
+check "ii: якорь не найден — отказ" not python3 $repo/lib/qs-integrate.py ii install --dir $QS/bad
+check "ii: при отказе файлы не тронуты" diff -r $T/bad-before $QS/bad/ii
 
 echo
 echo "итого: ok=$pass fail=$failn  (песочница $T)"

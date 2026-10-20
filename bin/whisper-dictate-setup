@@ -1,17 +1,16 @@
 #!/usr/bin/env fish
-# Мастер настройки whisper-dictate: GUI (zenity/kdialog), TUI (fzf) или CLI.
+# Настройка whisper-dictate: графическая обёртка (GTK), TUI (fzf) или CLI.
 #
-#   whisper-dictate-setup                  интерактивно; режим выбирается сам
+#   whisper-dictate-setup                  в терминале — TUI/CLI, без терминала — GUI
 #   whisper-dictate-setup --gui|--tui|--cli [...]   принудительный режим
 #   whisper-dictate-setup status | test [--full]    самопроверка
 #   whisper-dictate-setup key NAME [--env]          записать ключ (значение со stdin)
-#   whisper-dictate-setup keys ...                  бывший set-api-key.fish
+#   whisper-dictate-setup keys ...                  список и проверка ключей
 #   whisper-dictate-setup conf KEY [VALUE]          прочитать/записать dictate.conf
-#   whisper-dictate-setup model download NAME       tiny|base|small|medium|large-v3|large-v3-turbo|vad
 #   whisper-dictate-setup bind [apply|remove|status] [--key "SUPER + U"] [--file F]
 #                                  [--force] [--replace-legacy] [--dry-run]
+#   whisper-dictate-setup qs ii|standalone status|install|remove
 #   whisper-dictate-setup doctor [--fix] [--yes]    дубли в кейринге
-#   whisper-dictate-setup migrate                   подцепить старую установку
 #
 # Секреты читаются только со stdin / скрытым вводом, в argv не передаются.
 
@@ -40,15 +39,19 @@ function usage
 end
 
 function pick_mode
-    set -l has_gui 1
-    begin command -q zenity; or command -q kdialog; end; and begin test -n "$WAYLAND_DISPLAY"; or test -n "$DISPLAY"; end; and set has_gui 0
     if test -t 0
         command -q fzf; and echo tui; or echo cli
-    else if test $has_gui -eq 0
+    else if test -n "$WAYLAND_DISPLAY$DISPLAY"
         echo gui
     else
         echo cli
     end
+end
+
+function run_gui
+    set -l gui (command -s whisper-dictate-gui; or echo (dirname (realpath (status filename)))/whisper-dictate-gui)
+    test -x $gui; or begin; echo "whisper-dictate-gui не найден" >&2; exit 1; end
+    exec $gui
 end
 
 switch "$args[1]"
@@ -76,13 +79,6 @@ switch "$args[1]"
         else
             cat $WD_USER_CONF 2>/dev/null
         end
-    case model
-        switch "$args[2]"
-            case download; wd_model_download $args[3..-1]; exit $status
-            case link-legacy; wd_model_link_legacy $args[3]
-            case dir; wd_model_dir
-            case '*'; echo "Использование: model download NAME | link-legacy | dir" >&2; exit 1
-        end
     case bind
         set -l sub apply
         if contains -- $args[2] apply remove status
@@ -91,16 +87,17 @@ switch "$args[1]"
         end
         wd_bind $sub $args[2..-1]
         exit $status
+    case qs
+        python3 $WD_QS_PY $args[2..-1]
+        exit $status
     case doctor
         wd_doctor $args[2..-1]
         exit $status
-    case migrate
-        test -n "$args[2]"; or begin; echo "Использование: migrate DIR_С_МОДЕЛЯМИ" >&2; exit 1; end
-        wd_model_link_legacy $args[2]
-        echo "Модели подключены. Старые ~/.local/bin/dictate.fish и set-api-key.fish не тронуты —"
-        echo "переключите бинд командой: whisper-dictate-setup bind --replace-legacy"
     case ''
         test $mode = auto; and set mode (pick_mode)
+        if test $mode = gui
+            run_gui
+        end
         source $WD_LIBDIR/ui-$mode.fish
         source $WD_LIBDIR/setup-flow.fish
         wd_flow_main

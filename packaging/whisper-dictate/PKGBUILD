@@ -4,17 +4,15 @@
 pkgname=whisper-dictate
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Voice dictation for Wayland/Hyprland: whisper.cpp, optional cloud STT and translation, setup GUI/TUI'
+pkgdesc='Voice dictation for Wayland: whisper.cpp, optional cloud STT and translation, GTK setup, Quickshell widget'
 arch=(any)
 url='https://github.com/wowprofi4/whisper-dictate'
 license=(MIT)
-depends=(fish jq python libsecret util-linux curl ffmpeg pipewire wl-clipboard libnotify ydotool)
+depends=(fish jq python python-gobject gtk4 libsecret util-linux curl ffmpeg pipewire wl-clipboard libnotify ydotool)
 makedepends=()
 optdepends=('whisper.cpp-vulkan: GPU-accelerated local speech recognition (or any whisper-cli in PATH)'
-            'zenity: setup GUI'
-            'kdialog: setup GUI (KDE)'
-            'fzf: setup TUI'
-            'quickshell-ii-dictate: bar indicator integration for Quickshell ii')
+            'fzf: terminal setup menu (whisper-dictate-setup --tui)'
+            'quickshell: standalone widget and Quickshell integration')
 backup=(etc/whisper-dictate/dictate.conf)
 install=whisper-dictate.install
 _src="$startdir/../.."
@@ -23,12 +21,14 @@ package() {
   cd "$_src"
   install -Dm755 bin/whisper-dictate       "$pkgdir/usr/bin/whisper-dictate"
   install -Dm755 bin/whisper-dictate-setup "$pkgdir/usr/bin/whisper-dictate-setup"
+  install -Dm755 bin/whisper-dictate-gui   "$pkgdir/usr/bin/whisper-dictate-gui"
 
   local f
   for f in lib/*.fish lib/*.py lib/VERSION; do
     install -Dm644 "$f" "$pkgdir/usr/lib/whisper-dictate/${f##*/}"
   done
   chmod 755 "$pkgdir"/usr/lib/whisper-dictate/*.py
+  cp -r share/quickshell "$pkgdir/usr/lib/whisper-dictate/quickshell"
 
   install -Dm644 etc/whisper-dictate/dictate.conf "$pkgdir/etc/whisper-dictate/dictate.conf"
   install -Dm644 share/whisper-dictate/secrets.env.example \

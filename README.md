@@ -23,7 +23,7 @@
 
 - Wayland с `wl-clipboard`, `ydotool` (запущен `ydotoold`), PipeWire (`pw-record`), `ffmpeg`, `jq`, `fish`, `libsecret` (`secret-tool`), `libnotify`, `curl`.
 - Для локального распознавания: `whisper.cpp` (`whisper-cli`) и модель `ggml-*.bin`. Для GPU на AMD/Intel/NVIDIA удобнее собрать `whisper.cpp` с Vulkan (есть `packaging/whisper.cpp-vulkan`).
-- Для GUI-настройки: `zenity` (GNOME/другие) или `kdialog` (KDE). Для TUI: `fzf`. Без них настройка работает в CLI.
+- Для GUI-настройки: `python-gobject` и `gtk4` (ставятся как зависимости пакета). Для TUI в терминале: `fzf`. Без него работает CLI.
 
 Привязки к окружению нет: основной сценарий работает на Hyprland, KDE Plasma, GNOME и других Wayland-окружениях. Quickshell не нужен.
 
@@ -38,64 +38,52 @@ cd packaging/whisper-dictate    && makepkg -si
 
 Установка раскладывает:
 
-- `/usr/bin/whisper-dictate` и `/usr/bin/whisper-dictate-setup`;
-- `/usr/lib/whisper-dictate/` (библиотеки);
+- `/usr/bin/whisper-dictate`, `/usr/bin/whisper-dictate-setup`, `/usr/bin/whisper-dictate-gui`;
+- `/usr/lib/whisper-dictate/` (библиотеки и заготовки интеграции Quickshell);
 - `/etc/whisper-dictate/dictate.conf` (системный конфиг);
 - `/usr/share/whisper-dictate/secrets.env.example`;
 - `.desktop`-файлы в `/usr/share/applications/`.
 
-После установки запустите `whisper-dictate-setup`.
+После установки запустите `whisper-dictate-gui` (или `whisper-dictate-setup`).
 
 ## Настройка
 
-```
-whisper-dictate-setup              # режим выбирается сам: GUI, TUI или CLI
-whisper-dictate-setup --cli        # принудительно CLI
-```
+Окно настройки (`whisper-dictate-gui`) — основной способ. Все разделы в одном окне:
 
-Меню покрывает:
+- **Распознавание**: только локально или облако OpenRouter (с выбором модели); путь к основной модели `ggml-*.bin` и к VAD-модели выбирается файловым диалогом. Модели не скачиваются: укажите файлы, которые уже есть на диске.
+- **Перевод**: выключен, Gemini, DeepL или локальный скрипт; модель Gemini.
+- **API-ключи**: OpenRouter, DeepL, Gemini. Поле скрытое, ключ уходит в libsecret (или в `secrets.env`, если libsecret недоступен).
+- **Горячая клавиша**: на Hyprland записывает привязку; на других окружениях показывает, где назначить команду `whisper-dictate`.
+- **Quickshell**: кнопки подключения виджета (см. ниже).
+- **Проверка**: самотест установки.
 
-- **Проверку установки** и самотест;
-- **API-ключи** (OpenRouter, DeepL, Gemini) — ввод скрытый, в аргументах командной строки ключи не передаются;
-- **Распознавание речи**: только локально или облако;
-- **Провайдер перевода**;
-- **Модели whisper**: скачивание `tiny` … `large-v3-turbo`, VAD-модель, выбор текущей;
-- **Горячую клавишу**: на Hyprland меню добавляет блок в конфиг; на других окружениях показывает, где назначить команду `whisper-dictate` (KDE: «Параметры системы → Сочетания клавиш → Добавить команду»; GNOME: «Параметры → Клавиатура → Настраиваемые сочетания»);
-- **Индикатор в Quickshell ii** — необязательный шаг, см. ниже;
-- **Диагностику кейринга** (дубли записей в libsecret).
+Терминальный вариант: `whisper-dictate-setup --tui` (нужен `fzf`) или `whisper-dictate-setup --cli`.
 
 Прямые команды:
 
 ```
-whisper-dictate-setup model download large-v3-turbo
-whisper-dictate-setup key OPENROUTER_API_KEY         # значение со stdin
-whisper-dictate-setup conf STT openrouter            # прочитать/записать dictate.conf
-whisper-dictate-setup bind apply --key "SUPER + U"   # Hyprland
+whisper-dictate-setup key openrouter                  # значение со stdin
+whisper-dictate-setup conf MODEL /путь/к/ggml-medium.bin
+whisper-dictate-setup bind apply --key "SUPER + U"    # Hyprland
+whisper-dictate-setup qs ii install                   # или: qs standalone install
 whisper-dictate-setup doctor [--fix]
-whisper-dictate-setup migrate                        # подцепить старую установку
-whisper-dictate --test [--full]                      # самопроверка
+whisper-dictate --test [--full]                       # самопроверка
 ```
 
 ## Конфиг и секреты
 
 Приоритет настроек: переменная `DICTATE_<КЛЮЧ>` в окружении > `~/.config/whisper-dictate/dictate.conf` > `/etc/whisper-dictate/dictate.conf` > значение по умолчанию.
 
-Ключи API ищутся в таком порядке: переменные окружения (`OPENROUTER_API_KEY`, `DEEPL_API_KEY`, `GEMINI_API_KEY`) > `~/.config/whisper-dictate/secrets.env` (права 0600) > libsecret.
+Ключи API ищутся в таком порядке: переменные окружения (`OPENROUTER_API_KEY`, `DEEPL_API_KEY`, `GEMINI_API_KEY`) > `~/.config/whisper-dictate/secrets.env` (права 0600) > libsecret. Ключи, сохранённые раньше под именем `illogical-impulse`, при первой записи копируются в новую запись и продолжают работать.
 
-Модели по умолчанию лежат в `~/.local/share/whisper-dictate/models`.
+## Quickshell
 
-## Quickshell ii (необязательно)
+Два варианта интеграции, оба подключаются кнопкой в GUI или командой `whisper-dictate-setup qs <ii|standalone> install`. Удаление (`remove`) убирает только то, что добавил модуль.
 
-Если вы используете Quickshell ii (illogical-impulse), можно добавить кнопку диктовки в бар:
+- **Отдельный виджет** (`standalone`): самостоятельный индикатор записи и очереди. Копируется в `~/.config/quickshell/whisper-dictate/`. Запуск: `qs -c whisper-dictate` (можно добавить в автозапуск Hyprland).
+- **Logical Impulse (ii)**: кнопка диктовки в правой части бара и пункт «Диктовка» в настройках ii. Установщик добавляет блоки между маркерами `// whisper-dictate >>>` и `// whisper-dictate <<<` в `settings.qml`, `modules/common/Persistent.qml` и `modules/ii/bar/BarContent.qml`. Перед записью он проверяет, что нужные места в файлах найдены ровно один раз; если версия ii отличается, ничего не меняется и выводится ошибка. После установки перезапустите Quickshell.
 
-```
-cd packaging/quickshell-ii-dictate && makepkg -si
-quickshell-ii-dictate-apply --status   # подключён ли модуль
-quickshell-ii-dictate-apply            # подключить (с бэкапом Directories.qml)
-quickshell-ii-dictate-apply --revert   # откатить
-```
-
-Патч меняет только путь к скрипту диктовки в `~/.config/quickshell/ii/modules/common/Directories.qml`. Если ваша конфигурация Quickshell отличается и патч не ложится, скрипт выводит ошибку: проверьте вывод и при необходимости откатите через `--revert` или восстановите файл из `Directories.qml.bak_whisper-dictate`.
+Виджеты написаны по структуре upstream Logical Impulse и в этой среде не запускались: проверьте на своей сессии Quickshell.
 
 ## Тесты
 
@@ -108,11 +96,11 @@ fish tests/run.fish
 ## Структура
 
 ```
-bin/        whisper-dictate (переключатель записи), whisper-dictate-setup (настройка)
-lib/        общие функции, распознавание, настройка, адаптер окна (wm.fish)
+bin/        whisper-dictate (переключатель записи), whisper-dictate-setup (настройка), whisper-dictate-gui (GTK-окно)
+lib/        общие функции, распознавание, настройка, адаптер окна (wm.fish), qs-integrate.py (интеграция Quickshell)
 etc/        системный dictate.conf
-share/      .desktop-файлы, шаблон secrets.env
-packaging/  PKGBUILD для whisper-dictate, whisper.cpp-vulkan, quickshell-ii-dictate
+share/      .desktop-файлы, шаблон secrets.env, виджеты Quickshell (quickshell/ii, quickshell/standalone)
+packaging/  PKGBUILD для whisper-dictate и whisper.cpp-vulkan
 tests/      песочничные тесты
 docs/       скриншоты
 ```

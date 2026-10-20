@@ -11,6 +11,7 @@ source (dirname (status filename))/common.fish
 set -g WD_LIBDIR (dirname (realpath (status filename)))
 set -g WD_KEYRING_PY $WD_LIBDIR/keyring-doctor.py
 set -g WD_BIND_PY $WD_LIBDIR/hypr-bind.py
+set -g WD_QS_PY $WD_LIBDIR/qs-integrate.py
 source $WD_LIBDIR/wm.fish
 
 # ───────────────────────────── конфиг и секреты ────────────────────────────
@@ -144,66 +145,6 @@ function wd_model_dir
     wd_conf MODEL_DIR ~/.local/share/whisper-dictate/models
 end
 
-function wd_model_url --argument-names name
-    switch $name
-        case vad silero
-            echo https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
-        case '*'
-            echo https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$name.bin
-    end
-end
-
-function wd_model_file --argument-names name
-    switch $name
-        case vad silero; echo ggml-silero-v5.1.2.bin
-        case '*'; echo ggml-$name.bin
-    end
-end
-
-# wd_model_download NAME [--force]: tiny base small medium large-v3 large-v3-turbo vad
-function wd_model_download --argument-names name
-    test -n "$name"; or begin
-        echo "Использование: model download <tiny|base|small|medium|large-v3|large-v3-turbo|vad> [--force]" >&2
-        return 1
-    end
-    set -l dir (wd_model_dir)
-    set -l dst $dir/(wd_model_file $name)
-    mkdir -p $dir
-    if test -s $dst; and not contains -- --force $argv
-        echo "Уже есть: $dst"
-        return 0
-    end
-    set -l progress -sS
-    test -t 2; and set progress --progress-bar
-    echo "Загрузка "(wd_model_url $name)
-    curl -L --fail $progress -C - -o $dst.part (wd_model_url $name); or begin
-        echo "Загрузка не удалась" >&2
-        return 1
-    end
-    set -l size (stat -c %s $dst.part)
-    if test $size -lt 1000000
-        echo "Файл подозрительно мал ($size байт) — отброшен" >&2
-        rm -f $dst.part
-        return 1
-    end
-    mv $dst.part $dst
-    echo "Готово: $dst"
-end
-
-# Ссылается на готовые ggml-модели из указанной папки (например, от ручной сборки whisper.cpp).
-function wd_model_link_legacy --argument-names src
-    test -d "$src"; or begin; echo "Папка не найдена: $src" >&2; return 1; end
-    set -l dir (wd_model_dir)
-    mkdir -p $dir
-    for f in $src/ggml-*.bin
-        set -l base (basename $f)
-        string match -q 'for-tests-*' -- $base; and continue
-        if not test -e $dir/$base
-            ln -s $f $dir/$base; and echo "ссылка: $dir/$base -> $f"
-        end
-    end
-end
-
 # ─────────────────────────────── Hyprland ──────────────────────────────────
 
 function wd_bind
@@ -244,8 +185,8 @@ function wd_selftest
     string match -q '*/*' -- $model; or set model $mdir/$model
     set -l vad (wd_conf VAD_MODEL ggml-silero-v5.1.2.bin)
     string match -q '*/*' -- $vad; or set vad $mdir/$vad
-    test -s $model; and wd_t_ok "модель: $model"; or wd_t_fail "нет модели $model (whisper-dictate-setup model download large-v3-turbo)"
-    test -s $vad; and wd_t_ok "VAD: $vad"; or wd_t_fail "нет VAD-модели $vad (whisper-dictate-setup model download vad)"
+    test -s $model; and wd_t_ok "модель: $model"; or wd_t_fail "нет модели $model (укажите путь в whisper-dictate-gui)"
+    test -s $vad; and wd_t_ok "VAD: $vad"; or wd_t_fail "нет VAD-модели $vad (укажите путь в whisper-dictate-gui)"
     test -f (wd_conf SPLIT_SCRIPT $WD_LIBDIR/dictate-split.py); and wd_t_ok "dictate-split.py"; or wd_t_fail "dictate-split.py не найден"
 
     echo "Ключи:"

@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Графическая настройка whisper-dictate. Все изменения делает whisper-dictate-setup."""
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gio, GLib, Gtk
+
+SETUP = shutil.which("whisper-dictate-setup") or str(Path(__file__).resolve().parent / "whisper-dictate-setup")
+CONF = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "whisper-dictate" / "dictate.conf"
+STT_CLOUD_DEFAULT = "openai/gpt-4o-transcribe"
+KEY_SLOTS = [
+    ("openrouter", "OpenRouter", "распознавание в облаке и перевод"),
+    ("deepl", "DeepL", "перевод"),
+    ("gemini", "Google Gemini", "перевод"),
+]
+TRANSLATE_CHOICES = [("", "Выключен"), ("gemini", "Google Gemini"), ("deepl", "DeepL"), ("local", "Локальный скрипт")]
+QS_TARGETS = [
+    ("standalone", "Отдельный виджет", "Самостоятельный индикатор. Запуск: qs -c whisper-dictate"),
+    ("ii", "Logical Impulse (ii)", "Кнопка в баре и пункт «Диктовка» в настройках. После установки перезапустите Quickshell."),
+]
+
+
+def setup(*args, stdin=None):
+    try:
+        proc = subprocess.run([SETUP, *args], input=stdin, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        return 1, str(err)
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def read_conf():
+    values = {}
+    if CONF.is_file():
+        for line in CONF.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip() and not key.lstrip().startswith("#"):
+                values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+
+def saved_key_names():
+    rc, out = setup("keys", "--list")
+    if rc != 0:
+        return set()
+    return {line.strip() for line in out.splitlines()[1:] if line.strip()}
+
+
+def box(spacing=8):
+    return Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing,
+                   margin_top=16, margin_bottom=16, margin_start=16, margin_end=16)
+
+
+def heading(text):
+    label = Gtk.Label(xalign=0, margin_top=8)
+    label.set_markup(f"<b>{GLib.markup_escape_text(text)}</b>")
+    return label
+
+
+def hint(text):
+    label = Gtk.Label(label=text, xalign=0, wrap=True)
+    label.add_css_class("dim-label")
+    return label
+
+
+def row(*widgets):
+    line = Gtk.Box(spacing=8)
+    for widget in widgets:
+        line.append(widget)
+    return line
+
+
+def scrolled(child):
+    scroll = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
+    scroll.set_child(child)
+    return scroll
+
+
+class Settings(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Whisper Dictate", default_width=820, default_height=600)
+        self.conf = read_conf()
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, hexpand=True, vexpand=True)
+        sidebar = Gtk.StackSidebar(stack=self.stack)
+        self.status = Gtk.Label(xalign=0, wrap=True, margin_start=16, margin_end=16, margin_bottom=8)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.append(self.stack)
+        content.append(self.status)
+        split = Gtk.Box(spacing=0)
+        split.append(sidebar)
+        split.append(content)
+        self.set_child(split)
+
+        self.add_page("recognition", "Распознавание", self.recognition_page())
+        self.add_page("translation", "Перевод", self.translation_page())
+        self.add_page("keys", "API-ключи", self.keys_page())
+        self.add_page("hotkey", "Горячая клавиша", self.hotkey_page())
+        self.add_page("integrations", "Quickshell", self.integrations_page())
+        self.add_page("checks", "Проверка", self.checks_page())
+
+    def add_page(self, name, title, child):
+        self.stack.add_titled(scrolled(child), name, title)
+
+    def say(self, text):
+        self.status.set_text(text)
+
+    def write_conf(self, key, value):
+        rc, out = setup("conf", key, value)
+        if rc:
+            self.say(f"Ошибка записи {key}: {out}")
+            return False
+        self.conf[key] = value
+        self.say(f"Сохранено: {key}")
+        return True
+
+    def choose_file(self, entry):
+        dialog = Gtk.FileDialog(title="Выберите файл")
+
+        def done(dlg, result):
+            try:
+                entry.set_text(dlg.open_finish(result).get_path())
+            except GLib.Error:
+                pass
+
+        dialog.open(self, None, done)
+
+    def file_row(self, value, placeholder):
+        entry = Gtk.Entry(text=value, placeholder_text=placeholder, hexpand=True)
+        browse = Gtk.Button(label="Выбрать…")
+        browse.connect("clicked", lambda _b: self.choose_file(entry))
+        return entry, row(entry, browse)
+
+    def recognition_page(self):
+        page = box(10)
+        stt = self.conf.get("STT", "local")
+        cloud = stt.startswith("openrouter:")
+
+        self.stt_local = Gtk.CheckButton(label="Только локально (whisper.cpp)", active=not cloud)
+        self.stt_cloud = Gtk.CheckButton(label="Облако: OpenRouter", group=self.stt_local, active=cloud)
+        self.stt_model = Gtk.Entry(text=stt.split(":", 1)[1] if cloud else "",
+                                   placeholder_text=STT_CLOUD_DEFAULT, hexpand=True)
+        save_stt = Gtk.Button(label="Сохранить распознавание", halign=Gtk.Align.START)
+        save_stt.connect("clicked", self.save_stt)
+
+        self.model_entry, model_row = self.file_row(self.conf.get("MODEL", ""), "/путь/к/ggml-medium.bin")
+        self.vad_entry, vad_row = self.file_row(self.conf.get("VAD_MODEL", ""), "/путь/к/silero-vad.onnx")
+        save_models = Gtk.Button(label="Сохранить пути к моделям", halign=Gtk.Align.START)
+        save_models.connect("clicked", self.save_models)
+
+        page.append(heading("Распознавание речи"))
+        page.append(self.stt_local)
+        page.append(self.stt_cloud)
+        page.append(row(Gtk.Label(label="Модель OpenRouter", xalign=0), self.stt_model))
+        page.append(hint("Облако работает только с ключом OpenRouter. Если облако не ответило, кусок распознаётся локально."))
+        page.append(save_stt)
+        page.append(heading("Локальные модели whisper.cpp"))
+        page.append(hint("Модели не скачиваются: укажите файлы, которые уже есть на диске."))
+        page.append(row(Gtk.Label(label="Основная модель", xalign=0, width_chars=16), model_row))
+        page.append(row(Gtk.Label(label="VAD-модель", xalign=0, width_chars=16), vad_row))
+        page.append(save_models)
+        return page
+
+    def save_stt(self, _button):
+        if self.stt_cloud.get_active():
+            model = self.stt_model.get_text().strip() or STT_CLOUD_DEFAULT
+            self.write_conf("STT", f"openrouter:{model}")
+        else:
+            self.write_conf("STT", "local")
+
+    def save_models(self, _button):
+        for key, entry in (("MODEL", self.model_entry), ("VAD_MODEL", self.vad_entry)):
+            path = entry.get_text().strip()
+            if path:
+                self.write_conf(key, path)
+
+    def translation_page(self):
+        page = box(10)
+        current = self.conf.get("TRANSLATE_PROVIDER", "")
+        self.translate_buttons = []
+        group = None
+        page.append(heading("Провайдер перевода"))
+        page.append(hint("Перевод нужен, когда раскладка не русская."))
+        for value, label in TRANSLATE_CHOICES:
+            button = Gtk.CheckButton(label=label, group=group, active=value == current)
+            if group is None:
+                group = button
+            self.translate_buttons.append((value, button))
+            page.append(button)
+
+        self.gemini_model = Gtk.Entry(text=self.conf.get("GEMINI_MODEL", ""), hexpand=True,
+                                      placeholder_text="пусто — модель по умолчанию")
+        self.translate_script, script_row = self.file_row(self.conf.get("TRANSLATE_SCRIPT", ""),
+                                                         "/путь/к/local-translate.sh")
+        save = Gtk.Button(label="Сохранить перевод", halign=Gtk.Align.START)
+        save.connect("clicked", self.save_translate)
+
+        page.append(row(Gtk.Label(label="Модель Gemini", xalign=0, width_chars=16), self.gemini_model))
+        page.append(row(Gtk.Label(label="Скрипт локального перевода", xalign=0, width_chars=16), script_row))
+        page.append(save)
+        return page
+
+    def save_translate(self, _button):
+        chosen = next(value for value, button in self.translate_buttons if button.get_active())
+        self.write_conf("TRANSLATE_PROVIDER", chosen)
+        for key, entry in (("GEMINI_MODEL", self.gemini_model), ("TRANSLATE_SCRIPT", self.translate_script)):
+            value = entry.get_text().strip()
+            if value:
+                self.write_conf(key, value)
+
+    def keys_page(self):
+        page = box(12)
+        page.append(heading("API-ключи"))
+        page.append(hint("Ключи сохраняются в libsecret (связка ключей) или в ~/.config/whisper-dictate/secrets.env с правами 0600. В файлы настроек не попадают."))
+        self.key_entries = {}
+        self.key_states = {}
+        for slot, title, purpose in KEY_SLOTS:
+            entry = Gtk.PasswordEntry(hexpand=True, show_peek_icon=True)
+            state = Gtk.Label(xalign=0)
+            save = Gtk.Button(label="Сохранить")
+            save.connect("clicked", self.save_key, slot)
+            self.key_entries[slot] = entry
+            self.key_states[slot] = state
+            page.append(heading(f"{title} — {purpose}"))
+            page.append(row(entry, save))
+            page.append(state)
+        self.refresh_keys()
+        return page
+
+    def refresh_keys(self):
+        saved = saved_key_names()
+        for slot, _title, _purpose in KEY_SLOTS:
+            self.key_states[slot].set_text("сохранён" if slot in saved else "не задан")
+
+    def save_key(self, _button, slot):
+        value = self.key_entries[slot].get_text().strip()
+        if not value:
+            self.say("Поле ключа пустое.")
+            return
+        rc, out = setup("key", slot, stdin=value)
+        self.key_entries[slot].set_text("")
+        self.say(f"Ключ {slot} сохранён." if rc == 0 else f"Ошибка: {out}")
+        self.refresh_keys()
+
+    def hotkey_page(self):
+        page = box(10)
+        page.append(heading("Горячая клавиша"))
+        if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            page.append(hint("Автоматическая привязка есть только для Hyprland. В другом окружении назначьте сочетание для команды whisper-dictate в настройках клавиатуры."))
+            return page
+        self.hotkey = Gtk.Entry(text="SUPER + U", hexpand=True)
+        apply = Gtk.Button(label="Привязать")
+        apply.connect("clicked", self.apply_hotkey)
+        page.append(hint("Команда: whisper-dictate. Если сочетание уже занято, появится сообщение о конфликте."))
+        page.append(row(Gtk.Label(label="Сочетание", xalign=0, width_chars=10), self.hotkey, apply))
+        return page
+
+    def apply_hotkey(self, _button):
+        key = self.hotkey.get_text().strip()
+        if not key:
+            return
+        rc, out = setup("bind", "apply", "--key", key)
+        self.say(out or "Привязка записана." if rc == 0 else out)
+
+    def integrations_page(self):
+        page = box(14)
+        page.append(heading("Интеграция с Quickshell"))
+        page.append(hint("Модуль копируется в конфиги Quickshell. Удаление убирает только то, что добавил модуль."))
+        self.qs_states = {}
+        self.qs_buttons = {}
+        for target, title, note in QS_TARGETS:
+            state = Gtk.Label(xalign=0)
+            button = Gtk.Button(label="Подключить")
+            button.connect("clicked", self.toggle_qs, target)
+            self.qs_states[target] = state
+            self.qs_buttons[target] = button
+            page.append(heading(title))
+            page.append(hint(note))
+            page.append(row(state, button))
+        self.refresh_qs()
+        return page
+
+    def qs_installed(self, target):
+        return setup("qs", target, "status")[0] == 0
+
+    def refresh_qs(self):
+        for target, _title, _note in QS_TARGETS:
+            installed = self.qs_installed(target)
+            self.qs_states[target].set_text("установлено" if installed else "не установлено")
+            self.qs_buttons[target].set_label("Отключить" if installed else "Подключить")
+
+    def toggle_qs(self, _button, target):
+        action = "remove" if self.qs_installed(target) else "install"
+        rc, out = setup("qs", target, action)
+        self.say(out if rc == 0 else f"Ошибка: {out}")
+        self.refresh_qs()
+
+    def checks_page(self):
+        page = box(10)
+        self.report = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                                   left_margin=8, right_margin=8, top_margin=8, bottom_margin=8)
+        refresh = Gtk.Button(label="Проверить", halign=Gtk.Align.START)
+        refresh.connect("clicked", self.run_checks)
+        frame = Gtk.Frame()
+        frame.set_child(scrolled(self.report))
+        page.append(hint("Проверка запускает whisper-dictate-setup status: зависимости, модели, ключи, аудио."))
+        page.append(refresh)
+        page.append(frame)
+        return page
+
+    def run_checks(self, _button):
+        rc, out = setup("status")
+        self.report.get_buffer().set_text(out or "Проверка не вернула результата.")
+        self.say("Проверка завершена." if rc == 0 else "Проверка нашла проблемы: см. текст выше.")
+
+
+class Application(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.wowprofi4.WhisperDictate",
+                         flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        window = self.get_active_window() or Settings(self)
+        window.present()
+
+
+if __name__ == "__main__":
+    sys.exit(Application().run(sys.argv))

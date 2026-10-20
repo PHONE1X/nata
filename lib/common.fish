@@ -53,11 +53,14 @@ function wd_conf --argument-names key default
 end
 
 function wd_keyring_app
-    wd_conf KEYRING_APP illogical-impulse
+    wd_conf KEYRING_APP whisper-dictate
 end
 
+# Ключи, сохранённые до отделения от Quickshell ii, лежат под старым именем приложения.
 function wd_keyring_json
-    secret-tool lookup application (wd_keyring_app) 2>/dev/null
+    set -l json (secret-tool lookup application (wd_keyring_app) 2>/dev/null | string collect)
+    test -n "$json"; or set json (secret-tool lookup application illogical-impulse 2>/dev/null | string collect)
+    printf '%s' $json
 end
 
 # Единый JSON {apiKeys:{...}}: кейринг < secrets.env < окружение; несекретные

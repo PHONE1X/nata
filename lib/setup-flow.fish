@@ -1,4 +1,4 @@
-# Интерактивный мастер: общий сценарий поверх ui_* (gui/tui/cli).
+# Интерактивный мастер: общий сценарий поверх ui_* (tui/cli).
 # Требует: setup-core.fish и один из ui-*.fish.
 
 function wd_flow_capture --argument-names title
@@ -27,7 +27,7 @@ end
 function wd_flow_stt
     set -l pick (ui_menu "Распознавание речи" \
         local "Только локально (whisper.cpp)" \
-        or_gpt4o "Облако: OpenRouter openai/gpt-4o-transcribe (по умолчанию)" \
+        or_gpt4o "Облако: OpenRouter openai/gpt-4o-transcribe" \
         custom "Облако: другая модель OpenRouter…" \
         back "Назад")
     switch "$pick"
@@ -54,45 +54,27 @@ end
 
 function wd_flow_models
     set -l pick (ui_menu "Модели whisper" \
-        large-v3-turbo "large-v3-turbo (≈1.6 ГБ, по умолчанию)" \
-        medium "medium (≈1.5 ГБ)" \
-        small "small (≈470 МБ)" \
-        base "base (≈140 МБ)" \
-        vad "Silero VAD (≈1 МБ, нужен всегда)" \
-        legacy "Подцепить готовые модели из папки…" \
+        model "Файл основной модели (ggml-*.bin)" \
+        vad "Файл VAD-модели (silero)" \
         back "Назад")
-    test -n "$pick"; and test "$pick" != back; or return 0
-    if test "$pick" = legacy
-        set -l src (ui_input "Папка с ggml-*.bin" "")
-        test -n "$src"; or return 0
-        wd_flow_capture "Модели" wd_model_link_legacy "$src"
-        return 0
-    end
-    ui_confirm "Скачать $pick в "(wd_model_dir)"?"; or return 0
-    wd_flow_capture "Загрузка $pick" wd_model_download $pick
-    if test "$pick" != vad; and test "$pick" != legacy
-        ui_confirm "Сделать $pick моделью по умолчанию?"; and wd_conf_set MODEL (wd_model_file $pick)
+    switch "$pick"
+        case model
+            set -l path (ui_input "Полный путь к ggml-*.bin" (wd_conf MODEL ""))
+            test -n "$path"; and wd_conf_set MODEL $path
+        case vad
+            set -l path (ui_input "Полный путь к VAD-модели" (wd_conf VAD_MODEL ""))
+            test -n "$path"; and wd_conf_set VAD_MODEL $path
+        case '*'; return 0
     end
 end
 
-function wd_flow_quickshell
-    set -l base ~/.config
-    set -q XDG_CONFIG_HOME; and set base $XDG_CONFIG_HOME
-    set -l dir $base/quickshell/ii
-    if not test -f $dir/modules/common/Directories.qml
-        ui_info "Quickshell" "Quickshell ii не найден в $dir.\nИндикатор не подключён; диктовка работает и без него."
-        return 0
-    end
-    if not command -q quickshell-ii-dictate-apply
-        ui_info "Quickshell" "Для индикатора нужен пакет quickshell-ii-dictate (AUR).\nУстановите его и запустите whisper-dictate-setup снова."
-        return 0
-    end
-    if quickshell-ii-dictate-apply --status >/dev/null 2>&1
-        ui_confirm "Индикатор уже подключён. Отключить?"; or return 0
-        ui_info "Quickshell" (quickshell-ii-dictate-apply --revert 2>&1 | string collect)
+function wd_flow_qs --argument-names target
+    if python3 $WD_QS_PY $target status >/dev/null 2>&1
+        ui_confirm "Модуль уже подключён. Удалить?"; or return 0
+        ui_info "Quickshell" (python3 $WD_QS_PY $target remove 2>&1 | string collect)
     else
-        ui_confirm "Подключить индикатор диктовки в баре Quickshell ii? (копия Directories.qml будет сохранена)"; or return 0
-        ui_info "Quickshell" (quickshell-ii-dictate-apply 2>&1 | string collect)
+        ui_confirm "Подключить модуль диктовки?"; or return 0
+        ui_info "Quickshell" (python3 $WD_QS_PY $target install 2>&1 | string collect)
     end
 end
 
@@ -135,9 +117,10 @@ function wd_flow_main
             keys "API-ключи" \
             stt "Распознавание речи (локально / облако)" \
             translate "Провайдер перевода" \
-            models "Модели whisper" \
+            models "Модели whisper (пути к файлам)" \
             bind "Горячая клавиша" \
-            quickshell "Индикатор в Quickshell ii (необязательно)" \
+            qs-ii "Интеграция с Logical Impulse (ii)" \
+            qs-standalone "Виджет Quickshell (отдельный)" \
             doctor "Диагностика кейринга (дубли)" \
             quit "Выход")
         switch "$pick"
@@ -147,7 +130,8 @@ function wd_flow_main
             case translate; wd_flow_translate
             case models; wd_flow_models
             case bind; wd_flow_bind
-            case quickshell; wd_flow_quickshell
+            case qs-ii; wd_flow_qs ii
+            case qs-standalone; wd_flow_qs standalone
             case doctor; wd_flow_doctor
             case '*'; return 0
         end
