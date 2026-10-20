@@ -126,6 +126,7 @@ if test -z "$WD_LIBDIR"
     exit 1
 end
 source $WD_LIBDIR/common.fish
+source $WD_LIBDIR/wm.fish
 
 set -g DICT_DIR ~/.cache/dictate
 set -g LOCKDIR $DICT_DIR/recording.lock   # идёт запись (создаётся атомарным mkdir)
@@ -481,11 +482,6 @@ end
 
 # ───────────────────────── окно-получатель и раскладка ─────────────────────
 
-function dictate_current_keymap
-    hyprctl devices -j 2>/dev/null \
-        | jq -r '([.keyboards[] | select(.main == true) | .active_keymap] | first) // .keyboards[0].active_keymap // empty' 2>/dev/null
-end
-
 function dictate_lang_code --argument-names keymap
     # Английская раскладка на окне-получателе = «хочу английский текст»
     # (русская речь уедет в Gemini на перевод). Всё остальное — как есть.
@@ -549,7 +545,7 @@ function dictate_set_lang --argument-names lang scope addr class
     # Адреса закрытых окон вычищаются здесь же: Hyprland может когда-нибудь
     # переиспользовать адрес, и чужое старое закрепление прилипло бы к
     # новому окну.
-    set -l live (hyprctl clients -j 2>/dev/null | jq -c '[.[].address]' 2>/dev/null)
+    set -l live (wd_wm_live_addresses)
     test -n "$live"; or set live null
     env PF="$PINS_FILE" L="$lang" S="$scope" A="$addr" C="$class" LIVE="$live" flock $PINS_LOCK sh -c '
         [ -s "$PF" ] || printf "{}\n" > "$PF"
@@ -631,8 +627,7 @@ function dictate_layout_watcher --argument-names lockdir target_addr
     # течение 0.3 с после снятия $lockdir — не надо ловить его pid, и после
     # него не остаётся осиротевших процессов-подписчиков.
     while test -d $lockdir
-        set -l snap (hyprctl --batch "j/activewindow;j/devices" 2>/dev/null \
-            | jq -s -r '[(.[0].address // ""), (([.[1].keyboards[] | select(.main == true) | .active_keymap] | first) // .[1].keyboards[0].active_keymap // "")] | @tsv' 2>/dev/null)
+        set -l snap (wd_wm_snapshot)
         if test -n "$snap"
             set -l parts (string split \t -- "$snap")
             # Раскладку засчитываем, только если прямо сейчас сфокусировано
@@ -647,18 +642,7 @@ end
 
 function dictate_window_exists --argument-names addr
     test -n "$addr"; or return 1
-    set -l n (hyprctl clients -j 2>/dev/null | jq -r --arg a "$addr" '[.[] | select(.address == $a)] | length' 2>/dev/null)
-    test "$n" = "0"; and return 1
-    test -n "$n"
-end
-
-function dictate_focus --argument-names addr
-    # Тут Hyprland-форк с Lua-конфигом (hl.dsp.*, см.
-    # ~/.config/hypr/hyprland/keybinds.lua): классический синтаксис
-    # `dispatch focuswindow address:...` не парсится
-    # ('hl.dispatch: expected a dispatcher'). Рабочий эквивалент найден
-    # через `hyprctl eval` — интроспекцией принимаемых hl.dsp.focus ключей.
-    hyprctl dispatch "hl.dsp.focus({ window = \"address:$addr\" })" 2>&1
+    wd_wm_window_exists "$addr"
 end
 
 
@@ -685,7 +669,7 @@ function dictate_translate_local --argument-names ru_text
     # Бэкенд выбирается префиксом в .apiKeys.localTranslateModel (кейринг):
     # "ollama:<имя>" — модель на GPU через Ollama (load -> answer -> unload,
     # между вызовами в видеопамяти ничего не остаётся), "marian:<каталог>" —
-    # seq2seq-модель из ~/WORKSPACE/ai/mt-models на CPU, через scripts/ai/marian-translate.py,
+    # seq2seq-модель (каталог Marian/OPUS-MT) на CPU, через scripts/ai/marian-translate.py,
     # то есть вообще без GPU. Тот же скрипт, что использует sidebar-переводчик
     # с provider=local в ai-translate.sh, но модель у них теперь РАЗНАЯ:
     # LOCAL_TRANSLATE_SLOT=dictation заставляет скрипт читать
@@ -1095,7 +1079,7 @@ function dictate_paste --argument-names target_addr
     if test $mod_wait -eq 2; and test -n "$target_addr"
         # Пока ждали отпускания клавиш, пользователь мог уйти в другое окно —
         # вслепую жать Ctrl+V нельзя, текст уедет в чужое поле ввода.
-        set -l now (hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null)
+        set -l now (wd_wm_active_address)
         if test -n "$now"; and test "$now" != "$target_addr"
             dictate_log "focus moved to $now while waiting for modifiers — paste postponed"
             return 2
@@ -1144,7 +1128,7 @@ function dictate_paste --argument-names target_addr
 
     # Последняя попытка — на этой машине надёжной себя не показала.
     # Синтаксис тот же Lua-форковый, что и у dictate_focus.
-    set -l ss_out (hyprctl dispatch 'hl.dsp.send_shortcut({ mods = "CTRL", key = "V" })' 2>&1)
+    set -l ss_out (wd_wm_send_ctrl_v)
     set -l ss_status $status
     dictate_log "sendshortcut ctrl+v exit=$ss_status out=$ss_out"
     # Не отдаём наружу ss_status как есть: 2 у нас зарезервирована под
@@ -1176,13 +1160,13 @@ function dictate_insert_text --argument-names text target_addr
     # возвращается туда, где он был.
     set -l restore ""
     if test -n "$target_addr"
-        set -l cur (hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null)
+        set -l cur (wd_wm_active_address)
         if test -n "$cur"; and test "$cur" != "$target_addr"
             if test -f $LOCKDIR/pw.pid; and kill -0 (cat $LOCKDIR/pw.pid 2>/dev/null) 2>/dev/null
                 set restore $cur
             end
         end
-        set -l fw_out (dictate_focus $target_addr)
+        set -l fw_out (wd_wm_focus $target_addr)
         dictate_log "focus address:$target_addr -> $fw_out"
 
         # Фиксированной паузы 0.12с не всегда хватает: hl.dsp.focus иногда
@@ -1193,7 +1177,7 @@ function dictate_insert_text --argument-names text target_addr
         # ждём подтверждения через hyprctl activewindow, а не просто спим.
         set -l focus_ok false
         for i in (seq 1 10)
-            set -l now (hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null)
+            set -l now (wd_wm_active_address)
             if test "$now" = "$target_addr"
                 set focus_ok true
                 break
@@ -1240,7 +1224,7 @@ function dictate_insert_text --argument-names text target_addr
         # Пауза, чтобы Ctrl+V успел доехать до окна-получателя раньше, чем
         # фокус уедет обратно.
         sleep 0.25
-        set -l back_out (dictate_focus $restore)
+        set -l back_out (wd_wm_focus $restore)
         dictate_log "focus back address:$restore -> $back_out"
     end
 
@@ -1355,7 +1339,7 @@ function dictate_run_pending_watcher
             continue
         end
 
-        set -l cur (hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null)
+        set -l cur (wd_wm_active_address)
         set -l now (date +%s)
 
         for f in $files
@@ -1786,7 +1770,7 @@ function dictate_process_job --argument-names job
     # вставляем как обычно, никакой разницы для пользователя. Если нет —
     # не дёргаем фокус ради вставки, а откладываем текст до момента, когда
     # пользователь сам туда вернётся (или до таймаута — см. dictate_run_pending_watcher).
-    set -l cur (hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null)
+    set -l cur (wd_wm_active_address)
     set -l defer true
     set -l defer_reason "target not focused (cur=$cur)"
     if test -z "$addr"; or test "$cur" = "$addr"
@@ -1883,7 +1867,7 @@ function dictate_start
     set -l addr ""
     set -l title ""
     set -l class ""
-    set -l win (hyprctl activewindow -j 2>/dev/null | jq -r '[(.address // ""), (.title // ""), (.class // "")] | @tsv' 2>/dev/null)
+    set -l win (wd_wm_active_window)
     if test -n "$win"
         set -l p (string split \t -- "$win")
         set addr $p[1]
@@ -1891,7 +1875,7 @@ function dictate_start
         set class $p[3]
     end
 
-    set -l keymap (dictate_current_keymap)
+    set -l keymap (wd_wm_keymap)
 
     echo $seq > $LOCKDIR/seq
     echo $wav > $LOCKDIR/wav

@@ -59,11 +59,13 @@ function wd_flow_models
         small "small (≈470 МБ)" \
         base "base (≈140 МБ)" \
         vad "Silero VAD (≈1 МБ, нужен всегда)" \
-        legacy "Подцепить модели из ~/WORKSPACE/ai/whisper.cpp/models" \
+        legacy "Подцепить готовые модели из папки…" \
         back "Назад")
     test -n "$pick"; and test "$pick" != back; or return 0
     if test "$pick" = legacy
-        wd_flow_capture "Модели" wd_model_link_legacy
+        set -l src (ui_input "Папка с ggml-*.bin" "")
+        test -n "$src"; or return 0
+        wd_flow_capture "Модели" wd_model_link_legacy "$src"
         return 0
     end
     ui_confirm "Скачать $pick в "(wd_model_dir)"?"; or return 0
@@ -73,7 +75,32 @@ function wd_flow_models
     end
 end
 
+function wd_flow_quickshell
+    set -l base ~/.config
+    set -q XDG_CONFIG_HOME; and set base $XDG_CONFIG_HOME
+    set -l dir $base/quickshell/ii
+    if not test -f $dir/modules/common/Directories.qml
+        ui_info "Quickshell" "Quickshell ii не найден в $dir.\nИндикатор не подключён; диктовка работает и без него."
+        return 0
+    end
+    if not command -q quickshell-ii-dictate-apply
+        ui_info "Quickshell" "Для индикатора нужен пакет quickshell-ii-dictate (AUR).\nУстановите его и запустите whisper-dictate-setup снова."
+        return 0
+    end
+    if quickshell-ii-dictate-apply --status >/dev/null 2>&1
+        ui_confirm "Индикатор уже подключён. Отключить?"; or return 0
+        ui_info "Quickshell" (quickshell-ii-dictate-apply --revert 2>&1 | string collect)
+    else
+        ui_confirm "Подключить индикатор диктовки в баре Quickshell ii? (копия Directories.qml будет сохранена)"; or return 0
+        ui_info "Quickshell" (quickshell-ii-dictate-apply 2>&1 | string collect)
+    end
+end
+
 function wd_flow_bind
+    if not wd_wm_hyprland
+        ui_info "Горячая клавиша" "Автоматическая привязка есть только для Hyprland.\n\nЗадайте сочетание клавиш в настройках вашего окружения для команды:\n  whisper-dictate\nKDE: Параметры системы → Сочетания клавиш → Добавить команду.\nGNOME: Параметры → Клавиатура → Настраиваемые сочетания."
+        return 0
+    end
     set -l key (ui_input "Сочетание клавиш Hyprland" "SUPER + U")
     test -n "$key"; or return 0
     set -l out (wd_bind apply --key "$key" 2>&1 | string collect)
@@ -109,7 +136,8 @@ function wd_flow_main
             stt "Распознавание речи (локально / облако)" \
             translate "Провайдер перевода" \
             models "Модели whisper" \
-            bind "Горячая клавиша Hyprland" \
+            bind "Горячая клавиша" \
+            quickshell "Индикатор в Quickshell ii (необязательно)" \
             doctor "Диагностика кейринга (дубли)" \
             quit "Выход")
         switch "$pick"
@@ -119,6 +147,7 @@ function wd_flow_main
             case translate; wd_flow_translate
             case models; wd_flow_models
             case bind; wd_flow_bind
+            case quickshell; wd_flow_quickshell
             case doctor; wd_flow_doctor
             case '*'; return 0
         end

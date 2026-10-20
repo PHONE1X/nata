@@ -1,0 +1,10 @@
+post_install() {
+  echo ':: whisper-dictate установлен.'
+  echo ':: Настройка: whisper-dictate-setup (ключи, модели, горячая клавиша, Quickshell).'
+  echo ':: Переключатель записи: команда whisper-dictate (без аргументов).'
+  echo ':: Для вставки нужен запущенный ydotoold.'
+}
+
+post_upgrade() {
+  post_install
+}

@@ -79,7 +79,7 @@ switch "$args[1]"
     case model
         switch "$args[2]"
             case download; wd_model_download $args[3..-1]; exit $status
-            case link-legacy; wd_model_link_legacy
+            case link-legacy; wd_model_link_legacy $args[3]
             case dir; wd_model_dir
             case '*'; echo "Использование: model download NAME | link-legacy | dir" >&2; exit 1
         end
@@ -95,7 +95,8 @@ switch "$args[1]"
         wd_doctor $args[2..-1]
         exit $status
     case migrate
-        wd_model_link_legacy
+        test -n "$args[2]"; or begin; echo "Использование: migrate DIR_С_МОДЕЛЯМИ" >&2; exit 1; end
+        wd_model_link_legacy $args[2]
         echo "Модели подключены. Старые ~/.local/bin/dictate.fish и set-api-key.fish не тронуты —"
         echo "переключите бинд командой: whisper-dictate-setup bind --replace-legacy"
     case ''

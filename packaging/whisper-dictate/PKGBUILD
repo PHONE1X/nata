@@ -16,6 +16,7 @@ optdepends=('whisper.cpp-vulkan: GPU-accelerated local speech recognition (or an
             'fzf: setup TUI'
             'quickshell-ii-dictate: bar indicator integration for Quickshell ii')
 backup=(etc/whisper-dictate/dictate.conf)
+install=whisper-dictate.install
 _src="$startdir/../.."
 
 package() {

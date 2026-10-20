@@ -11,6 +11,7 @@ source (dirname (status filename))/common.fish
 set -g WD_LIBDIR (dirname (realpath (status filename)))
 set -g WD_KEYRING_PY $WD_LIBDIR/keyring-doctor.py
 set -g WD_BIND_PY $WD_LIBDIR/hypr-bind.py
+source $WD_LIBDIR/wm.fish
 
 # ───────────────────────────── конфиг и секреты ────────────────────────────
 
@@ -189,11 +190,12 @@ function wd_model_download --argument-names name
     echo "Готово: $dst"
 end
 
-# Находит модели из прежней установки (~/WORKSPACE/ai/whisper.cpp/models) и ссылается на них.
-function wd_model_link_legacy
+# Ссылается на готовые ggml-модели из указанной папки (например, от ручной сборки whisper.cpp).
+function wd_model_link_legacy --argument-names src
+    test -d "$src"; or begin; echo "Папка не найдена: $src" >&2; return 1; end
     set -l dir (wd_model_dir)
     mkdir -p $dir
-    for f in ~/WORKSPACE/ai/whisper.cpp/models/ggml-*.bin
+    for f in $src/ggml-*.bin
         set -l base (basename $f)
         string match -q 'for-tests-*' -- $base; and continue
         if not test -e $dir/$base
@@ -228,8 +230,8 @@ function wd_selftest
             wd_t_fail "$c не найден"
         end
     end
-    for c in ydotool hyprctl secret-tool
-        command -q $c; and wd_t_ok $c; or wd_t_warn "$c не найден (нужен для вставки/бинда/кейринга)"
+    for c in ydotool secret-tool
+        command -q $c; and wd_t_ok $c; or wd_t_warn "$c не найден (нужен для вставки/кейринга)"
     end
     pgrep -x ydotoold >/dev/null 2>&1; and wd_t_ok "ydotoold запущен"; or wd_t_warn "ydotoold не запущен — вставка Ctrl+V не сработает"
 
@@ -271,12 +273,17 @@ function wd_selftest
         end
     end
 
-    echo "Hyprland:"
-    set -l brep (python3 $WD_BIND_PY status 2>&1)
-    if test $status -eq 0
-        wd_t_ok (string join ' ' -- $brep[2..-1])
+    echo "Окно и горячая клавиша:"
+    if wd_wm_hyprland
+        set -l brep (python3 $WD_BIND_PY status 2>&1)
+        if test $status -eq 0
+            wd_t_ok (string join ' ' -- $brep[2..-1])
+        else
+            wd_t_warn "бинд не настроен (whisper-dictate-setup bind)"
+        end
     else
-        wd_t_warn "бинд не настроен (whisper-dictate-setup bind)"
+        wd_t_ok "Hyprland не обнаружен: текст вставляется в активное окно"
+        wd_t_warn "горячую клавишу задайте в настройках окружения: команда whisper-dictate"
     end
 
     if test $full -eq 1
