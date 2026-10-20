@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Nata
+Name[ru]=Nata
+GenericName=Voice dictation
+GenericName[ru]=Голосовой ввод
+Comment=Configure voice dictation: keys, speech recognition, translation, hotkey
+Comment[ru]=Настройка голосового ввода: ключи, распознавание, перевод, горячая клавиша
+Exec=whisper-dictate-gui
+Icon=audio-input-microphone
+Categories=AudioVideo;Audio;
+Keywords=dictate;whisper;speech;voice;диктовка;голос;
+StartupNotify=true
+Terminal=false

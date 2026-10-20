@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=Whisper Dictate Setup (terminal)
-Name[ru]=Настройка Whisper Dictate (терминал)
+Name=Nata Setup (terminal)
+Name[ru]=Nata: настройка (терминал)
 Comment=Terminal setup for voice dictation
 Exec=whisper-dictate-setup --tui
 Icon=audio-input-microphone

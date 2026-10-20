@@ -83,7 +83,7 @@ def scrolled(child):
 
 class Settings(Gtk.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="Whisper Dictate", default_width=820, default_height=600)
+        super().__init__(application=app, title="Nata", default_width=820, default_height=600)
         self.conf = read_conf()
 
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, hexpand=True, vexpand=True)
@@ -322,7 +322,7 @@ class Settings(Gtk.ApplicationWindow):
 
 class Application(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="io.github.wowprofi4.WhisperDictate",
+        super().__init__(application_id="io.github.phone1x.Nata",
                          flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
 
     def do_activate(self):

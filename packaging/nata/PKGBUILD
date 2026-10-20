@@ -1,12 +1,12 @@
 # Maintainer: wowprofi4 <wowprofi4@gmail.com>
-# Локальная сборка из дерева репозитория: cd packaging/whisper-dictate && makepkg -si
+# Локальная сборка из дерева репозитория: cd packaging/nata && makepkg -si
 # Для AUR заменить _src на tarball релиза (source=(...) + sha256sums).
-pkgname=whisper-dictate
+pkgname=nata
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Voice dictation for Wayland: whisper.cpp, optional cloud STT and translation, GTK setup, Quickshell widget'
+pkgdesc='Nata: voice dictation for Wayland (whisper.cpp, optional cloud STT and translation, GTK setup, Quickshell widget)'
 arch=(any)
-url='https://github.com/wowprofi4/whisper-dictate'
+url='https://github.com/PHONE1X/nata'
 license=(MIT)
 depends=(fish jq python python-gobject gtk4 libsecret util-linux curl ffmpeg pipewire wl-clipboard libnotify ydotool)
 makedepends=()
@@ -14,7 +14,7 @@ optdepends=('whisper.cpp-vulkan: GPU-accelerated local speech recognition (or an
             'fzf: terminal setup menu (whisper-dictate-setup --tui)'
             'quickshell: standalone widget and Quickshell integration')
 backup=(etc/whisper-dictate/dictate.conf)
-install=whisper-dictate.install
+install=nata.install
 _src="$startdir/../.."
 
 package() {

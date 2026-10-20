@@ -112,7 +112,7 @@ end
 
 function wd_flow_main
     while true
-        set -l pick (ui_menu "Whisper Dictate — настройка" \
+        set -l pick (ui_menu "Nata — настройка" \
             test "Проверка установки" \
             keys "API-ключи" \
             stt "Распознавание речи (локально / облако)" \

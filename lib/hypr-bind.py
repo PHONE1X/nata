@@ -145,7 +145,7 @@ def live_conflicts(want, use_live):
 def make_block(path, key, cmd):
     c = comment(path)
     if is_lua(path):
-        body = f'hl.bind("{key}", hl.dsp.exec_cmd("{cmd}"), {{ description = "Whisper Dictate: голосовой ввод" }})'
+        body = f'hl.bind("{key}", hl.dsp.exec_cmd("{cmd}"), {{ description = "Nata: голосовой ввод" }})'
     else:
         mods, k = normalize(key, r"\+")
         body = f"bind = {' '.join(sorted(mods))}, {k}, exec, {cmd}"

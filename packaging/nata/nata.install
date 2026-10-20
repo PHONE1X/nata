@@ -1,5 +1,5 @@
 post_install() {
-  echo ':: whisper-dictate установлен.'
+  echo ':: Nata установлена.'
   echo ':: Настройка: whisper-dictate-gui (ключи, модели, горячая клавиша, Quickshell).'
   echo ':: В терминале то же меню: whisper-dictate-setup --tui (нужен fzf).'
   echo ':: Переключатель записи: команда whisper-dictate (без аргументов).'

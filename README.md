@@ -1,6 +1,6 @@
-# whisper-dictate
+# Nata
 
-Голосовая диктовка для Linux (Wayland). Нажал горячую клавишу, говоришь, нажал её ещё раз — распознанный текст вставляется в активное окно.
+Голосовая диктовка для Linux (Wayland). Команды и конфиг по-прежнему называются `whisper-dictate`. Нажал горячую клавишу, говоришь, нажал её ещё раз — распознанный текст вставляется в активное окно.
 
 ![Главное меню настройки](docs/screenshots/setup-main.png)
 ![Выбор распознавания речи](docs/screenshots/setup-stt.png)
@@ -29,12 +29,20 @@
 
 ## Установка
 
-Пакет собирается локально из дерева репозитория (публикация в AUR пока не сделана):
+Одной командой (клонирует репозиторий и собирает пакет `nata` через `makepkg -si`):
 
 ```
-cd packaging/whisper.cpp-vulkan && makepkg -si     # необязательно: GPU-whisper
-cd packaging/whisper-dictate    && makepkg -si
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/PHONE1X/nata/master/install.sh)"
 ```
+
+Или вручную из клона:
+
+```
+git clone https://github.com/PHONE1X/nata && cd nata/packaging/whisper.cpp-vulkan && makepkg -si   # необязательно: GPU-whisper
+cd ../nata && makepkg -si
+```
+
+Публикация в AUR пока не сделана; когда появится, пакет будет ставиться через `paru -S nata`.
 
 Установка раскладывает:
 
@@ -100,7 +108,7 @@ bin/        whisper-dictate (переключатель записи), whisper-d
 lib/        общие функции, распознавание, настройка, адаптер окна (wm.fish), qs-integrate.py (интеграция Quickshell)
 etc/        системный dictate.conf
 share/      .desktop-файлы, шаблон secrets.env, виджеты Quickshell (quickshell/ii, quickshell/standalone)
-packaging/  PKGBUILD для whisper-dictate и whisper.cpp-vulkan
+packaging/  PKGBUILD для nata и whisper.cpp-vulkan
 tests/      песочничные тесты
 docs/       скриншоты
 ```
